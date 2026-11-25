@@ -47,6 +47,8 @@ jobs:
             -scheme HermesMobile \
             -configuration Release \
             -destination 'generic/platform=iOS' \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
