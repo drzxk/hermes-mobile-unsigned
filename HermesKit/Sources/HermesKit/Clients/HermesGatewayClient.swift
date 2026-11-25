@@ -1,0 +1,756 @@
+import ComposableArchitecture
+import DependenciesMacros
+import Foundation
+
+// MARK: - Client
+
+/// The live wire to the Hermes gateway: a single WebSocket carrying newline-delimited
+/// JSON-RPC 2.0. `connect` opens the socket and yields decoded server event frames; `send`
+/// issues a request and awaits its `{id,result}` via an internal pending-request map.
+@DependencyClient
+public struct HermesGatewayClient: Sendable {
+  /// Open a connection to the server (base URL + auth regime) and stream decoded event
+  /// frames: each `GatewayFrame` carries the event plus its `session_id` / `seq` and, on
+  /// `gateway.ready`, the replay epoch (#98). Client-synthesized events are wrapped with no
+  /// envelope data. The stream finishes when the socket closes or the consumer stops
+  /// iterating.
+  ///
+  /// The transport branches on `AuthSession`:
+  /// - `.token` → `…/api/ws?token=<token>` (byte-identical to the legacy path).
+  /// - `.cookie` → mint a fresh single-use `?ticket=` via `POST /api/auth/ws-ticket`
+  ///   (cookie-authed) per connect, then `…/api/ws?ticket=<ticket>`. A `401` from the
+  ///   ticket mint means the session is fully dead → the stream yields `.authExpired` and
+  ///   finishes (a non-retryable signal the reducer turns into re-auth, not backoff).
+  /// - `.bearer` → the same per-connect ticket mint, authenticated with
+  ///   `Authorization: Bearer` from `BearerTokenStore` (which refreshes first when the
+  ///   access token is inside its leeway). The WS URL is then identical to the cookie
+  ///   regime's — the gateway accepts a ticket regardless of how it was minted.
+  public var connect: @Sendable (_ baseURL: URL, _ auth: AuthSession) -> AsyncStream<GatewayFrame> = { _, _ in
+    AsyncStream { $0.finish() }
+  }
+  /// Send a JSON-RPC request on the current connection and await its result.
+  ///
+  /// The per-request timeout is chosen by METHOD (see `longRunningMethods`) rather than
+  /// passed per call — the budget is a property of the server handler, not of the call
+  /// site, so it can't be forgotten by a caller.
+  public var send: @Sendable (_ method: String, _ params: JSONValue) async throws -> JSONValue
+  /// Tear down the current connection.
+  public var disconnect: @Sendable () -> Void
+
+  /// Methods whose server-side handler legitimately outlives the default budget, so they
+  /// get `longRequestTimeout` instead.
+  ///
+  /// The gateway's slash pipeline is documented as blocking its dispatcher "for seconds to
+  /// minutes" (`tui_gateway/server.py`): worker-routed commands have a 45s pipe budget of
+  /// their own, and `/compress` doesn't even use the worker — it runs an **unbounded**
+  /// inline LLM summarisation (`_live_slash_command_output` → `_mirror_slash_side_effects`).
+  /// Under the default budget `/compress` reliably timed out on exactly the sessions big
+  /// enough to warrant it, while the compression SUCCEEDED server-side. The desktop
+  /// reference hit the same wall and budgets 120s for its equivalent `session.compress`
+  /// call (`use-prompt-actions/slash.ts`). `command.dispatch` is included because the
+  /// gateway routes `/compress`/`/compact` through it (`_PENDING_INPUT_COMMANDS`) and
+  /// because it is this client's `slash.exec` fallback. `session.compress` is the DEDICATED
+  /// RPC `/compress`/`/compact` now call directly (bypassing the slash worker for
+  /// version-independent, desktop-parity behavior): its handler runs the same unbounded
+  /// inline LLM summarisation, so it needs the identical 120s budget (the desktop's
+  /// `SESSION_COMPRESS_TIMEOUT_MS`).
+  public static let longRunningMethods: Set<String> = ["slash.exec", "command.dispatch", "session.compress"]
+}
+
+public enum GatewayError: Error, Equatable, Sendable {
+  case notConnected
+  case disconnected
+  case server(String)
+  case timedOut(method: String)
+  /// The gated `ws-ticket` mint returned `401` — the cookie session is fully dead and
+  /// reconnecting won't help. Surfaced as `GatewayEvent.authExpired` on the stream.
+  case authExpired
+  /// The `ws-ticket` mint failed transiently (network/5xx/non-401): the consumer should
+  /// fall back to the existing reconnect backoff, exactly as for a dropped socket.
+  case ticketUnavailable
+
+  public var message: String {
+    switch self {
+    case .notConnected: "Not connected."
+    case .disconnected: "Connection lost."
+    case let .server(message): message
+    case let .timedOut(method): "request timed out: \(method)"
+    case .authExpired: "Your session expired. Sign in again."
+    case .ticketUnavailable: "Couldn’t obtain a connection ticket."
+    }
+  }
+
+  /// True when the server rejected the request as an unknown JSON-RPC method (`-32601`).
+  /// `InboundFrame` keeps only the error message, not the code, so we match the server's
+  /// stable `"unknown method: <name>"` text — used to gate attachment uploads (#8).
+  public var isUnknownMethod: Bool {
+    if case let .server(message) = self {
+      return message.lowercased().hasPrefix("unknown method")
+    }
+    return false
+  }
+
+  /// True when the server rejected a `config.set {key:"reasoning"}` because the level isn't in
+  /// its ladder. A gateway older than upstream #62650 (2026-07-12) doesn't know `max`/`ultra`:
+  /// `tui_gateway/server.py`'s `config.set` handler runs `parse_reasoning_effort(arg)`, gets
+  /// `None`, and answers `_err(rid, 4002, f"unknown reasoning value: {value}")` — a server
+  /// error, NOT `-32601`, so the usual unknown-method probe can't gate it. `InboundFrame` keeps
+  /// only the error message and not the code, so — same contract as `isUnknownMethod` — we match
+  /// the server's stable text. Used to latch the extended levels off for the chat slot (#81).
+  public var isUnknownReasoningValue: Bool {
+    if case let .server(message) = self {
+      return message.lowercased().hasPrefix("unknown reasoning value")
+    }
+    return false
+  }
+
+  /// True for the gateway's 4010 `agent does not support steer`: the method exists but this
+  /// session's agent has no `steer()`. Matched on the stable text like `isUnknownMethod`
+  /// (`InboundFrame` keeps only the message). Flips the per-slot `steerSupported` off.
+  public var isSteerUnsupported: Bool {
+    if case let .server(message) = self {
+      return message.lowercased().hasPrefix("agent does not support steer")
+    }
+    return false
+  }
+
+  /// True when the socket dropped (no transport) — distinct from a server-side protocol
+  /// error. A dropped socket is already surfaced by the reducer's `.reconnecting` status, so
+  /// callers can avoid raising a redundant "Connection lost." banner that would linger past
+  /// the reconnect.
+  public var isDisconnected: Bool {
+    if case .disconnected = self { return true }
+    return false
+  }
+
+  /// True when a per-request RPC timeout fired (`timedOut`). Over a HALF-OPEN socket (e.g. a
+  /// stale connection after process suspension / NAT rebind) this is the first — and possibly
+  /// only — transport symptom for minutes: the receive loop may not finish (no `.gatewayClosed`)
+  /// even though nothing can get through. Callers should treat it as transport-shaped, like
+  /// `isDisconnected`, when deciding whether to redial.
+  public var isTimedOut: Bool {
+    if case .timedOut = self { return true }
+    return false
+  }
+
+  /// A session-authority host refused a `session.mutate` because its fences moved
+  /// (`revision_conflict` / `stale_generation`, #157): nothing was written; re-read and retry.
+  public var isStaleFence: Bool {
+    if case let .server(message) = self {
+      return message == "revision_conflict" || message == "stale_generation"
+    }
+    return false
+  }
+
+  /// True when the server rejected the request because the live runtime session id is stale
+  /// (e.g. after a background→foreground the agent rebuilt/invalidated the in-memory session).
+  /// `InboundFrame` keeps only the error message, so we match the server's stable
+  /// `"session not found"` text (case-insensitive) — used to self-heal outbound RPCs by
+  /// transparently re-resuming for a fresh live id and replaying the call (#17). Mirrors
+  /// `isUnknownMethod`.
+  /// A canonical session-authority host (`gateway.ready.session_authority: true`, v0.22.3+)
+  /// never sends that text: its refusal is `{code: 4001, message: <reason>}`, and a session
+  /// it has no row for is the bare reason `not_found` (#166), matched exactly.
+  public var isSessionNotFound: Bool {
+    if case let .server(message) = self {
+      return message == "not_found" || message.lowercased().contains("session not found")
+    }
+    return false
+  }
+
+  /// A session-authority host refused a `prompt.submit` with `permission_denied`: its
+  /// `submission()` raises that when THIS connection isn't attached to the session (a new
+  /// socket before its hydrate's `session.resume` lands, or after the server dropped the
+  /// subscription). A re-resume attaches it, so the submit heals like a not-found (#166).
+  /// The same reason also covers a real authz refusal, so it is healed ONLY on a submit, and
+  /// only once: a real refusal fails the replay and banners as before.
+  public var isSubmitUnattached: Bool {
+    if case let .server(message) = self { return message == "permission_denied" }
+    return false
+  }
+}
+
+// MARK: - Live / factory
+
+public extension HermesGatewayClient {
+  /// `tokenStore` is injectable (mirroring `HermesRESTClient.live`) so bearer tests get
+  /// their own store instead of the process-wide one.
+  static func live(
+    session: URLSession = URLSession(configuration: .default),
+    requestTimeout: Duration = .seconds(30),
+    longRequestTimeout: Duration = .seconds(120),
+    tokenStore: BearerTokenStore = .shared
+  ) -> HermesGatewayClient {
+    .make(
+      requestTimeout: requestTimeout,
+      longRequestTimeout: longRequestTimeout,
+      mintTicket: { baseURL, auth in
+        switch auth {
+        case .token:
+          // Unreachable: `connect` opens `…/api/ws?token=` synchronously and never mints
+          // for the legacy regime. Answer transiently rather than inventing a ticket.
+          throw GatewayError.ticketUnavailable
+        case let .cookie(cookieSession):
+          return try await wsTicket(baseURL: baseURL, cookieSession: cookieSession, session: session)
+        case .bearer:
+          return try await wsTicket(baseURL: baseURL, tokenStore: tokenStore, session: session)
+        }
+      },
+      makeTransport: { wsURL in
+        URLSessionWebSocketTransport(url: wsURL, session: session)
+      }
+    )
+  }
+
+  /// Core factory parameterized by a transport-maker (keyed on the **resolved** WS URL) and
+  /// a ticket-minter so tests can inject both a fake socket and a fake ticket endpoint. The
+  /// connection state (id counter, pending map) lives in a per-connect `GatewayConnection`
+  /// actor; `store` holds the current one for `send`/`disconnect`.
+  ///
+  /// `clock` drives the per-request timeout — injectable so tests can use a `TestClock`
+  /// and fire/hold the timeout deterministically instead of racing real wall-clock time.
+  /// `longRequestTimeout` is the budget for `longRunningMethods` (the slash pipeline).
+  ///
+  /// For the gated regimes (`.cookie` and `.bearer`), `connect` mints a fresh ws-ticket
+  /// **per connect** (never cached) and connects with `?ticket=`. `.token` auth skips the
+  /// mint entirely and uses `?token=`, byte-identical to the legacy path. A `401` from the
+  /// mint (`GatewayError.authExpired`) yields `.authExpired` and finishes the stream; any
+  /// other mint failure finishes the stream like a dropped socket so the reducer's existing
+  /// backoff retries.
+  ///
+  /// `mintTicket` takes the whole `AuthSession` (not just the cookie jar) so the one
+  /// minter resolves the regime — the gated branches below are then literally the same code.
+  static func make(
+    requestTimeout: Duration = .seconds(30),
+    longRequestTimeout: Duration = .seconds(120),
+    clock: any Clock<Duration> = ContinuousClock(),
+    mintTicket: @escaping @Sendable (_ baseURL: URL, _ auth: AuthSession) async throws -> String = { _, _ in
+      throw GatewayError.ticketUnavailable
+    },
+    makeTransport: @escaping @Sendable (_ wsURL: URL) -> any WebSocketTransport
+  ) -> HermesGatewayClient {
+    let store = ConnectionStore()
+    return HermesGatewayClient(
+      connect: { baseURL, auth in
+        let (stream, continuation) = AsyncStream<GatewayFrame>.makeStream()
+        // The connection opened by this `connect` (set once the transport is built). Held in
+        // a box so the single `onTermination` handler can shut it down — `onTermination` is
+        // last-writer-wins, so we must NOT overwrite it per-open (that clobbers cleanup).
+        let opened = LockIsolated<GatewayConnection?>(nil)
+        // Open a connection over the resolved WS URL: build the transport + connection
+        // actor, register it for `send`/`disconnect`, and start the receive loop.
+        @Sendable func open(_ wsURL: URL) {
+          let connection = GatewayConnection(
+            transport: makeTransport(wsURL),
+            events: continuation,
+            requestTimeout: requestTimeout,
+            longRequestTimeout: longRequestTimeout,
+            clock: clock
+          )
+          store.set(connection)
+          opened.setValue(connection)
+          Task { await connection.start() }
+        }
+        switch auth {
+        case let .token(token):
+          // Token mode: no async work — open synchronously so an immediate `send` finds the
+          // connection (byte-identical to the legacy path). No setup task to cancel.
+          //
+          // BACKWARD-COMPAT GUARD: nothing in the gated regimes may reach into this branch.
+          // No ticket mint, no `await` before `open` — inserting either would make the URL
+          // arrive asynchronously and break the legacy contract that an immediate `send`
+          // right after `connect` finds a live connection. The `.bearer` path is a `.cookie`
+          // twin below; it must never be "unified" with this one.
+          open(webSocketURL(base: baseURL, token: token))
+          // Single termination handler: shut down the opened connection on consumer cancel.
+          continuation.onTermination = { _ in
+            if let connection = opened.value { Task { await connection.shutdown() } }
+          }
+        case .cookie, .bearer:
+          // Gated modes: mint a fresh single-use ticket first. Done in a Task because
+          // `connect` returns the stream synchronously; mint failures surface on the stream.
+          //
+          // `.bearer` shares this branch rather than copying it: the two regimes differ ONLY
+          // in how `mintTicket` authenticates (cookie jar vs `Authorization: Bearer`, resolved
+          // by the minter off `auth`), and the cancellation choreography below is load-bearing
+          // in both — a duplicated copy is a copy that can drift.
+          let setupTask = Task {
+            do {
+              let ticket = try await mintTicket(baseURL, auth)
+              // The mint awaited above; if the consumer cancelled meanwhile, the termination
+              // handler already ran (and saw no `opened` connection). Bail before `open()` so
+              // we don't spawn an orphan connection nothing will ever shut down.
+              try Task.checkCancellation()
+              open(webSocketURL(base: baseURL, ticket: ticket))
+            } catch is CancellationError {
+              continuation.finish()
+            } catch GatewayError.authExpired {
+              // Session fully dead → non-retryable. Signal re-auth and finish.
+              continuation.yield(GatewayFrame(.authExpired))
+              continuation.finish()
+            } catch {
+              // Transient mint failure → finish like a dropped socket; the reducer's
+              // backoff re-calls `connect` (which re-mints the ticket).
+              continuation.finish()
+            }
+          }
+          // Single termination handler composing BOTH cleanups (last-writer-wins, so we can
+          // only register one): cancel the in-flight mint AND shut down a connection that has
+          // already opened. Either may be the live one depending on the cancel timing.
+          continuation.onTermination = { _ in
+            setupTask.cancel()
+            if let connection = opened.value { Task { await connection.shutdown() } }
+          }
+        }
+        return stream
+      },
+      send: { method, params in
+        guard let connection = store.get() else { throw GatewayError.notConnected }
+        return try await connection.send(method: method, params: params)
+      },
+      disconnect: {
+        let connection = store.get()
+        store.set(nil)
+        Task { await connection?.shutdown() }
+      }
+    )
+  }
+}
+
+extension HermesGatewayClient: DependencyKey {
+  public static var liveValue: HermesGatewayClient { .live() }
+  public static var testValue: HermesGatewayClient { HermesGatewayClient() }
+}
+
+public extension DependencyValues {
+  var hermesGateway: HermesGatewayClient {
+    get { self[HermesGatewayClient.self] }
+    set { self[HermesGatewayClient.self] = newValue }
+  }
+}
+
+// MARK: - Connection actor
+
+/// Owns one socket's lifecycle: the JSON-RPC id counter, the pending-request map, and
+/// the receive loop that routes frames to either the event stream or a waiting `send`.
+actor GatewayConnection {
+  private let transport: any WebSocketTransport
+  private let events: AsyncStream<GatewayFrame>.Continuation
+  private let requestTimeout: Duration
+  private let longRequestTimeout: Duration
+  private let clock: any Clock<Duration>
+  private var idCounter = 0
+  private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
+  private var timeoutTasks: [Int: Task<Void, Never>] = [:]
+  private var receiveTask: Task<Void, Never>?
+  private var isFinished = false
+  private var declinesNotShown = false
+  /// The connection's one `client.capabilities` attempt (started by the first `gateway.ready`)
+  /// — no background retry: the next connect re-advertises (the advertisement is per
+  /// transport and dies with the socket).
+  private var advertisementTask: Task<Void, Never>?
+  /// `.ready` is held back until the advertisement settles or `advertisementReadyCap`
+  /// fires, so the reducer's first `session.resume` / `session.create` goes out after the
+  /// server knows the phone answers prompts. Once open, the gate stays open.
+  private var readyGateOpen = false
+  /// The `gateway.ready` frame that arrived while the gate was closed (the latest one, if
+  /// several). It is released as-is when the gate opens, so its `replay_epoch` /
+  /// `session_authority` survive the advertisement wait (#98) — the reducer's `.ready`
+  /// handling is idempotent, so a duplicate frame needs no count.
+  private var heldReady: GatewayFrame?
+  private var readyCapTask: Task<Void, Never>?
+
+  /// How long `.ready` waits on the advertisement. A hung `client.capabilities` keeps
+  /// running past the cap (its late outcome still counts) under the normal request budget.
+  static let advertisementReadyCap: Duration = .seconds(5)
+
+  init(
+    transport: any WebSocketTransport,
+    events: AsyncStream<GatewayFrame>.Continuation,
+    requestTimeout: Duration = .seconds(30),
+    longRequestTimeout: Duration = .seconds(120),
+    clock: any Clock<Duration> = ContinuousClock()
+  ) {
+    self.transport = transport
+    self.events = events
+    self.requestTimeout = requestTimeout
+    self.longRequestTimeout = longRequestTimeout
+    self.clock = clock
+  }
+
+  func start() {
+    guard receiveTask == nil else { return }
+    receiveTask = Task { [weak self] in await self?.receiveLoop() }
+  }
+
+  func send(method: String, params: JSONValue) async throws -> JSONValue {
+    // Never register against a torn-down connection — that continuation would
+    // never be resumed (the receive loop is gone), hanging the caller forever.
+    guard !isFinished else { throw GatewayError.disconnected }
+    idCounter += 1
+    let id = idCounter
+    let request = JSONRPCRequest(id: id, method: method, params: params)
+    // `JSONRPCRequest.wireText()`, not a bare `JSONEncoder`: it turns slash escaping off, which
+    // an attachment upload depends on to stay inside the server's WebSocket frame (see
+    // `JSONRPCRequest.wireEncoder`).
+    let text = try request.wireText()
+    return try await withCheckedThrowingContinuation { continuation in
+      // Register before transmitting so a fast response can't race ahead of us.
+      pending[id] = continuation
+      // Per-id timeout: if the server never acks (`prompt.submit` acks fast, so this
+      // only catches a stuck server), reject with `.timedOut` rather than hang forever.
+      // The slash pipeline gets the longer budget — its handlers do unbounded server-side
+      // work (see `HermesGatewayClient.longRunningMethods`).
+      let budget = HermesGatewayClient.longRunningMethods.contains(method)
+        ? longRequestTimeout : requestTimeout
+      timeoutTasks[id] = Task { [budget, clock] in
+        do { try await clock.sleep(for: budget) } catch { return }
+        await fireTimeout(id: id, method: method)
+      }
+      Task { await transmit(id: id, text: text) }
+    }
+  }
+
+  /// Called from the per-id timeout task after the sleep elapses. Resumes the waiter
+  /// with `.timedOut` only if it removes the pending entry itself; if another path
+  /// (response/failure/finish) already won, the entry is gone and this is a no-op.
+  private func fireTimeout(id: Int, method: String) {
+    timeoutTasks.removeValue(forKey: id)
+    pending.removeValue(forKey: id)?.resume(throwing: GatewayError.timedOut(method: method))
+  }
+
+  func shutdown() {
+    guard !isFinished else { return }
+    receiveTask?.cancel()
+    transport.cancel()
+    finish(error: .disconnected)
+  }
+
+  private func transmit(id: Int, text: String) async {
+    do {
+      try await transport.send(text)
+    } catch {
+      cancelTimeout(id)
+      pending.removeValue(forKey: id)?.resume(throwing: error)
+    }
+  }
+
+  /// Cancel and drop the timeout task for `id` so it can't fire a spurious `.timedOut`
+  /// after the request has already resolved (and doesn't leak).
+  private func cancelTimeout(_ id: Int) {
+    timeoutTasks.removeValue(forKey: id)?.cancel()
+  }
+
+  private func receiveLoop() async {
+    while !Task.isCancelled {
+      let text: String
+      do {
+        text = try await transport.receive()
+      } catch {
+        break // socket closed or errored
+      }
+      // A single WS message may carry multiple newline-delimited frames.
+      for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+        handle(frame: String(line))
+      }
+    }
+    finish(error: .disconnected)
+  }
+
+  /// Route one server→client request, synchronously on the receive loop — the decline
+  /// matrix:
+  /// - a rendered method (`PendingServerRequest`) is yielded as `.serverRequest` at once, so
+  ///   a turn terminal read right after it cannot overtake the card;
+  /// - a rendered method whose params are not even a JSON object gets that kind's skip
+  ///   through `request.answer` — no client can render it, so the agent is not left hanging;
+  /// - a rendered method whose object params fail the phone's decode gets NO answer (a newer
+  ///   shape a desktop sharing the session may render — never deny or cancel it for everyone)
+  ///   and a `.serverRequestFailed` banner, so the phone user knows why nothing shows;
+  /// - a window-owned bridge gets the non-settling 4404, and only once the advertisement
+  ///   acknowledged `declines_not_shown`;
+  /// - anything else gets nothing — another attached client may answer it, and an error
+  ///   would settle it (or, on a vault prompt, feed a refusal string to the password manager).
+  /// Every send runs in a `Task`: an RPC awaited here would deadlock, since its
+  /// acknowledgement arrives through this same loop.
+  private func handleServerRequest(id: String, method: String, params: JSONValue) {
+    if let request = PendingServerRequest(id: id, method: method, params: params) {
+      events.yield(GatewayFrame(.serverRequest(request)))
+    } else if let prompt = PromptMethod(rawValue: method) {
+      if let skip = PendingServerRequest.malformedSkip(for: method, params: params) {
+        Task { await answerMalformed(id: id, prompt: prompt, result: skip) }
+      } else {
+        events.yield(GatewayFrame(.serverRequestFailed(message: prompt.unreadableMessage)))
+      }
+    } else if declinesNotShown, PendingServerRequest.windowOwnedMethods.contains(method) {
+      Task { await declineNotShown(id: id) }
+    }
+  }
+
+  private func answerMalformed(id: String, prompt: PromptMethod, result skip: JSONValue) async {
+    do {
+      let result = try await send(method: "request.answer", params: .object([
+        "id": .string(id), "result": skip,
+      ]))
+      _ = try AnswerStatus(response: result)
+    } catch {
+      reportFailure(prompt.skipFailureContext, error: error)
+    }
+  }
+
+  private func declineNotShown(id: String) async {
+    guard !isFinished else { return }
+    let frame: JSONValue = .object([
+      "jsonrpc": .string("2.0"), "id": .string(id),
+      "error": .object([
+        "code": .number(4404), "message": .string("Not shown on this client"),
+      ]),
+    ])
+    do {
+      // `wireEncoder`, like every outbound frame (no `\/` escaping).
+      let data = try JSONRPCRequest.wireEncoder.encode(frame)
+      try await transport.send(String(decoding: data, as: UTF8.self))
+    } catch {
+      reportFailure("Couldn’t decline a window request", error: error)
+    }
+  }
+
+  /// The connection's single `client.capabilities {server_requests: true}` attempt. Opens
+  /// the ready gate whatever the outcome: success stores `declinesNotShown`; `-32601` is
+  /// silent (v2026.9.14 speaks v7 without the probe — it does NOT mean legacy); any other
+  /// failure yields `.serverRequestsUnavailable` AFTER the gate opened, so the reducer's
+  /// `.ready` reset cannot wipe it. Never retried on this socket.
+  private func advertiseServerRequests() async {
+    guard !isFinished else { return }
+    let failure: (any Error)?
+    do {
+      let result = try await send(method: "client.capabilities", params: .object(["server_requests": .bool(true)]))
+      guard case .object = result else { throw GatewayError.server("Malformed client.capabilities result") }
+      declinesNotShown = result["declines_not_shown"]?.boolValue == true
+      failure = nil
+    } catch let error as GatewayError where error.isUnknownMethod {
+      failure = nil
+    } catch {
+      failure = error
+    }
+    openReadyGate()
+    if let failure, !isFinished, !(failure is CancellationError) {
+      let message = (failure as? GatewayError)?.message ?? "Connection lost."
+      events.yield(GatewayFrame(.serverRequestsUnavailable(
+        message: "Couldn’t enable approvals and other prompts: \(message)"
+      )))
+    }
+  }
+
+  /// A `gateway.ready` frame: pass it straight through once the gate is open; otherwise hold
+  /// it and (first time only) start the advertisement plus the cap that bounds the wait.
+  /// The advertisement runs in a `Task` — awaiting it here would deadlock the receive loop
+  /// its acknowledgement arrives through. Frames arriving meanwhile are yielded as usual.
+  private func receivedReady(_ frame: GatewayFrame) {
+    if readyGateOpen {
+      events.yield(frame)
+      return
+    }
+    heldReady = frame
+    guard advertisementTask == nil else { return }
+    advertisementTask = Task { [weak self] in await self?.advertiseServerRequests() }
+    readyCapTask = Task { [weak self, clock] in
+      do { try await clock.sleep(for: GatewayConnection.advertisementReadyCap) } catch { return }
+      await self?.openReadyGate()
+    }
+  }
+
+  private func openReadyGate() {
+    guard !readyGateOpen, !isFinished else { return }
+    readyGateOpen = true
+    readyCapTask?.cancel()
+    readyCapTask = nil
+    if let heldReady { events.yield(heldReady) }
+    heldReady = nil
+  }
+
+  private func reportFailure(_ context: String, error: any Error) {
+    guard !isFinished, !(error is CancellationError) else { return }
+    let message = (error as? GatewayError)?.message ?? "Connection lost."
+    events.yield(GatewayFrame(.serverRequestFailed(message: "\(context): \(message)")))
+  }
+
+  private func handle(frame: String) {
+    guard let parsed = try? InboundFrame(data: Data(frame.utf8)) else { return }
+    switch parsed {
+    case let .event(gatewayFrame):
+      if case .ready = gatewayFrame.event { return receivedReady(gatewayFrame) }
+      events.yield(gatewayFrame)
+    case let .serverRequest(id, method, params):
+      handleServerRequest(id: id, method: method, params: params)
+    case let .response(id, result):
+      cancelTimeout(id)
+      pending.removeValue(forKey: id)?.resume(returning: result)
+    case let .failure(id, message):
+      if let id {
+        cancelTimeout(id)
+        pending.removeValue(forKey: id)?.resume(throwing: GatewayError.server(message))
+      }
+    case .ignored:
+      break
+    }
+  }
+
+  private func finish(error: GatewayError) {
+    guard !isFinished else { return }
+    isFinished = true
+    advertisementTask?.cancel()
+    advertisementTask = nil
+    readyCapTask?.cancel()
+    readyCapTask = nil
+    events.finish()
+    for (_, task) in timeoutTasks { task.cancel() }
+    timeoutTasks.removeAll()
+    let outstanding = pending
+    pending.removeAll()
+    for (_, continuation) in outstanding { continuation.resume(throwing: error) }
+  }
+}
+
+/// Holds the current connection so the stateless client closures can reach it.
+private final class ConnectionStore: @unchecked Sendable {
+  private let lock = NSLock()
+  private var current: GatewayConnection?
+  func set(_ connection: GatewayConnection?) { lock.withLock { current = connection } }
+  func get() -> GatewayConnection? { lock.withLock { current } }
+}
+
+// MARK: - Transport
+
+/// The minimal socket surface the connection needs. Abstracted so tests can swap in a
+/// fake without a real network.
+public protocol WebSocketTransport: Sendable {
+  func send(_ text: String) async throws
+  func receive() async throws -> String
+  func cancel()
+}
+
+final class URLSessionWebSocketTransport: WebSocketTransport, @unchecked Sendable {
+  private let task: URLSessionWebSocketTask
+
+  init(url: URL, session: URLSession) {
+    task = Self.makeTask(url: url, session: session)
+    task.resume()
+  }
+
+  /// The configured, not-yet-resumed socket task. Inbound messages are accepted up to the
+  /// server's frame ceiling (`JSONRPCRequest.maxWebSocketFrameBytes`): the
+  /// `URLSessionWebSocketTask` default (1 MiB) fails `receive()` on a bigger message and kills
+  /// the socket, e.g. a large `session.resume` history or a `session.events.since` reply (the
+  /// replay ring holds up to 4 MiB per session).
+  static func makeTask(url: URL, session: URLSession) -> URLSessionWebSocketTask {
+    let task = session.webSocketTask(with: url)
+    task.maximumMessageSize = JSONRPCRequest.maxWebSocketFrameBytes
+    return task
+  }
+
+  func send(_ text: String) async throws {
+    try await task.send(.string(text))
+  }
+
+  func receive() async throws -> String {
+    switch try await task.receive() {
+    case let .string(text): return text
+    case let .data(data): return String(decoding: data, as: UTF8.self)
+    @unknown default: return ""
+    }
+  }
+
+  func cancel() {
+    task.cancel(with: .goingAway, reason: nil)
+  }
+}
+
+/// Token-mode WS URL — **byte-identical to the legacy path** (`…/api/ws?token=<token>`).
+/// A `nil` token omits the query entirely (the unauthenticated probe case).
+func webSocketURL(base: URL, token: String?) -> URL {
+  webSocketURL(base: base, query: token.map { [URLQueryItem(name: "token", value: $0)] })
+}
+
+/// Gated-mode WS URL — `…/api/ws?ticket=<ticket>` from a freshly minted single-use ticket.
+func webSocketURL(base: URL, ticket: String) -> URL {
+  webSocketURL(base: base, query: [URLQueryItem(name: "ticket", value: ticket)])
+}
+
+private func webSocketURL(base: URL, query: [URLQueryItem]?) -> URL {
+  var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) ?? URLComponents()
+  comps.scheme = (comps.scheme == "https" || comps.scheme == "wss") ? "wss" : "ws"
+  comps.path = "/api/ws"
+  comps.queryItems = query
+  return comps.url ?? base
+}
+
+// MARK: - ws-ticket mint
+
+/// Decoded `POST /api/auth/ws-ticket` response — the gateway returns the single-use ticket
+/// under `ticket` (verified against the Hermes web server). Lenient: nothing else is read.
+private struct WSTicketResponse: Decodable { let ticket: String }
+
+/// Mint a single-use WS ticket for a gated (cookie) session via `POST /api/auth/ws-ticket`.
+/// The cookie jar authenticates the request; we rehydrate the persisted `CookieSession`
+/// into the live session's storage first so a fresh launch authenticates. A `401` (session
+/// fully dead) maps to `GatewayError.authExpired` (non-retryable); any other failure maps
+/// to `GatewayError.ticketUnavailable` (transient → reducer backoff retries).
+func wsTicket(baseURL: URL, cookieSession: CookieSession, session: URLSession) async throws -> String {
+  // Rehydrate cookies so a relaunched app (empty jar) still authenticates the mint.
+  if let storage = session.configuration.httpCookieStorage {
+    for cookie in cookieSession.cookies.compactMap(\.httpCookie) { storage.setCookie(cookie) }
+  }
+  // `.none`: the jar carries the credential — byte-identical to the legacy cookie mint.
+  return try await wsTicketRequest(baseURL: baseURL, auth: .none, session: session)
+}
+
+/// Mint a single-use WS ticket for a `.bearer` (native OAuth) session.
+///
+/// The access token comes from `BearerTokenStore` — the ONLY bearer read in the app — so a
+/// token inside its refresh leeway is rotated (single-flight, persisted) before the mint
+/// rather than being spent on a request the gateway would 401. The store's expiry verdict
+/// passes straight through as `GatewayError.authExpired` (non-retryable → re-auth); a 503 or
+/// transport failure becomes `.ticketUnavailable` with the tokens INTACT, so the reducer's
+/// backoff re-dials and re-mints.
+func wsTicket(baseURL: URL, tokenStore: BearerTokenStore, session: URLSession) async throws -> String {
+  let accessToken: String
+  do {
+    accessToken = try await tokenStore.validAccessToken(refresh: { base, expiring in
+      try await nativeRefresh(baseURL: base, expiring: expiring, session: session)
+    })
+  } catch GatewayError.authExpired {
+    throw GatewayError.authExpired
+  } catch {
+    throw GatewayError.ticketUnavailable
+  }
+  return try await wsTicketRequest(baseURL: baseURL, auth: .bearer(accessToken), session: session)
+}
+
+/// The `POST /api/auth/ws-ticket` round trip itself, shared by both gated regimes so the
+/// request (method, path, empty body) and the status mapping can't diverge between them —
+/// only the `auth` header differs.
+private func wsTicketRequest(
+  baseURL: URL, auth: RequestAuth, session: URLSession
+) async throws -> String {
+  var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) ?? URLComponents()
+  comps.path = "/api/auth/ws-ticket"
+  guard let url = comps.url else { throw GatewayError.ticketUnavailable }
+  var request = URLRequest(url: url)
+  request.httpMethod = "POST"
+  auth.apply(to: &request)
+
+  let data: Data
+  let response: URLResponse
+  do {
+    (data, response) = try await session.data(for: request)
+  } catch {
+    throw GatewayError.ticketUnavailable
+  }
+  guard let http = response as? HTTPURLResponse else { throw GatewayError.ticketUnavailable }
+  if http.statusCode == 401 { throw GatewayError.authExpired }
+  guard (200..<300).contains(http.statusCode) else { throw GatewayError.ticketUnavailable }
+  guard let decoded = try? JSONDecoder().decode(WSTicketResponse.self, from: data) else {
+    throw GatewayError.ticketUnavailable
+  }
+  return decoded.ticket
+}

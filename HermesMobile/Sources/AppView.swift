@@ -1,0 +1,173 @@
+import ComposableArchitecture
+import HermesKit
+import SwiftUI
+
+/// Root view: the onboarding screen until connected, then a `NavigationSplitView` whose
+/// sidebar is the session list (inside the navigation stack that pushes chat screens in
+/// compact width) and whose detail column is the live chat (regular width, #80).
+struct AppView: View {
+  @Bindable var store: StoreOf<AppFeature>
+  @Environment(\.scenePhase) private var scenePhase
+  // Read at the ROOT, outside the split view: inside a sidebar column the environment
+  // reports `.compact` even on a 13" iPad, which would flip the reducer into the stack
+  // layout for the whole window.
+  @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+  @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+  private var layout: AppFeature.Layout {
+    appLayout(horizontal: horizontalSizeClass, vertical: verticalSizeClass)
+  }
+
+  var body: some View {
+    content
+      .task { store.send(.task) }
+      .sheet(item: $store.scope(state: \.reauth, action: \.reauth)) { reauthStore in
+        ReauthView(store: reauthStore)
+      }
+      // Observe lifecycle here (view stays thin) and dispatch into the reducer, which fans
+      // foreground out to reconnect/re-hydrate + list refresh and background out to an
+      // immediate snapshot/anchor flush. Behaviour is unit-tested via `scenePhaseChanged`.
+      .onChange(of: scenePhase) { _, newPhase in
+        store.send(.scenePhaseChanged(newPhase.appPhase))
+      }
+      // Same pattern for the layout regime (#80): `appLayout` decides, the reducer owns every
+      // consequence (marker push/clear, the regular-width new-chat seat). `initial: true` so
+      // the layout is known BEFORE the home screen lands: the landing fills and the cold-launch
+      // push replay read `state.layout` at that moment. Attached to `content` (every root
+      // branch) rather than the split view for the same reason.
+      .onChange(of: layout, initial: true) { _, layout in
+        store.send(.layoutChanged(layout))
+      }
+  }
+
+  /// Which root branch wins is decided ONCE, by `AppFeature.State.rootScreen` in HermesKit
+  /// (where its precedence is unit-tested by `swift test`) — this `switch` only renders the
+  /// verdict. Deliberately NOT `if rootScreen == .home, let homeStore = …`: re-deriving the
+  /// same optional the resolver already consulted means a disagreement falls silently through
+  /// to onboarding, which is the exact failure the enum exists to prevent.
+  @ViewBuilder
+  private var content: some View {
+    switch store.rootScreen {
+    case .home:
+      if let homeStore = store.scope(state: \.home, action: \.home) {
+        // The Settings tab is its OWN stack (`SettingsView` owns the `SettingsPath` pushes), so
+        // it is layered OVER the whole split view — a sibling, never inside a column: the
+        // column's navigation controller would nest it (unsupported; on device its root title
+        // vanished under the list's bar). The split stays mounted underneath (hidden, inert),
+        // so the list's `.task` poll, its sheets and the live chat aren't torn down per switch.
+        // `AppFeature` leaves the tab whenever a chat is routed (a compact marker or a regular
+        // seat), so a chat never lands hidden under it.
+        let settingsStore = homeStore.effectiveTab == .settings
+          ? homeStore.scope(state: \.settings, action: \.settings.presented)
+          : nil
+        ZStack {
+          // ONE split view for both widths. In compact the split collapses to its sidebar
+          // column, so the stack below is the whole screen — the iPhone layout, byte-identical
+          // to the pre-#80 root. In regular the sidebar shows the list and the detail column
+          // shows the live-chat slot directly: the path holds no marker there
+          // (`AppFeature.isChatDetached`), so the chat is never rendered twice.
+          NavigationSplitView {
+            NavigationStack(path: $store.scope(state: \.path, action: \.path)) {
+              // Which row is highlighted is `AppFeature.State.highlightedSessionID` (nil in
+              // compact — unit-tested there). A plain optional, deliberately NOT
+              // `List(selection:)`: selection would become a second source of truth for which
+              // session is open, racing the reducer-owned slot on push taps, archive refills,
+              // and layout changes.
+              SessionListView(
+                store: homeStore,
+                highlightedSessionID: store.highlightedSessionID,
+                needsInputSessionIDs: store.needsInputSessionIDs
+              )
+            } destination: { _ in
+              // The path holds only thin session-key markers — the REAL chat state lives in
+              // the app-level live-chat slot, so a running turn's socket survives pops.
+              chatDetail
+            }
+            .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 400)
+          } detail: {
+            // Empty in compact, where the collapsed split view renders the sidebar's stack
+            // alone: leaving the detail column with no content is what stops the collapsed
+            // split from pushing a SECOND copy of the chat over the marker's destination.
+            if store.layout == .regular {
+              chatDetail
+                // A slot replacement in regular has no new marker to give the chat a new view,
+                // so key it on the fill counter: without it the incoming session inherits the
+                // outgoing one's transcript scroll offset and composer focus.
+                .id(store.slotGeneration)
+            }
+          }
+          .opacity(settingsStore == nil ? 1 : 0)
+          .allowsHitTesting(settingsStore == nil)
+          .accessibilityHidden(settingsStore != nil)
+          if let settingsStore {
+            SettingsView(store: settingsStore) {
+              HomeTabBar(store: homeStore)
+            }
+            // Modal for VoiceOver: the split view stays mounted underneath, and
+            // `.accessibilityHidden` on it doesn't reach the list's UIKit-backed rows.
+            .accessibilityAddTraits(.isModal)
+          }
+        }
+      }
+    case .connecting:
+      ProgressView("Connecting…")
+    case .connectionFailed:
+      // Launch auto-connect failed for a reason that isn't a verdict on the credentials
+      // (no network, or a proxy reporting the agent down): the stored credentials are fine,
+      // so keep them and offer a retry instead of dropping to onboarding. Auth failures never
+      // populate this slot — they land on the onboarding branch below.
+      if let failedStore = store.scope(state: \.connectionFailed, action: \.connectionFailed) {
+        ConnectionFailedView(store: failedStore)
+      }
+    case .onboarding:
+      // `ConnectionView` hosts its own `NavigationStack` (Welcome → Server → Sign in).
+      ConnectionView(store: store.scope(state: \.onboarding, action: \.onboarding))
+    }
+  }
+
+  /// The live-chat slot's screen, rendered by BOTH columns: the sidebar stack's pushed
+  /// destination in compact, the detail column in regular. Defensive empty view if the slot
+  /// is missing (e.g. after logout mid-pop; in regular the reducer keeps the slot seated).
+  @ViewBuilder
+  private var chatDetail: some View {
+    if let chatStore = store.scope(state: \.liveChat, action: \.liveChat) {
+      ChatView(store: chatStore)
+        // The view's disappearance routes through the PARENT (never the scoped child
+        // store): `AppFeature.chatViewDisappeared` guards a nil slot (logout/quit may
+        // have cleared it while the screen was still animating away) and owns the
+        // idle-pop teardown policy — deferred here until the pop animation finished,
+        // so the outgoing screen stays rendered and no action hits an absent child.
+        // The same event fires when the chat moves between columns on a size-class
+        // change; the reducer records the new layout first, so that one is a no-op.
+        .onDisappear { store.send(.chatViewDisappeared) }
+    }
+  }
+}
+
+private extension ScenePhase {
+  /// Map SwiftUI's `ScenePhase` onto HermesKit's SwiftUI-free `AppFeature.ScenePhase`.
+  var appPhase: AppFeature.ScenePhase {
+    switch self {
+    case .active: return .active
+    case .inactive: return .inactive
+    case .background: return .background
+    @unknown default: return .inactive
+    }
+  }
+}
+
+/// The open Duo has regular width and height; a landscape Plus/Max has compact height.
+private func appLayout(
+  horizontal: UserInterfaceSizeClass?, vertical: UserInterfaceSizeClass?
+) -> AppFeature.Layout {
+  guard horizontal == .regular, vertical == .regular else { return .compact }
+  return .regular
+}
+
+#Preview {
+  AppView(
+    store: Store(initialState: AppFeature.State()) {
+      AppFeature()
+    }
+  )
+}

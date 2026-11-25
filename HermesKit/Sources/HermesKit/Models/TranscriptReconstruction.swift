@@ -1,0 +1,180 @@
+import Foundation
+
+/// Pure, server-authoritative re-hydration of a chat transcript from the `session.resume`
+/// `messages` array. The gateway returns the server's **cooked** history shape (built by
+/// `_history_to_messages`), NOT the raw DB rows — each entry is one of:
+///   - a text row: `{role: "user" | "assistant" | "system", text, ...}` (an assistant row
+///     may also carry `reasoning` / `reasoning_content` / `reasoning_details`);
+///   - a tool row: `{role: "tool", name, context}` — the server has already matched the
+///     tool call to its result and flattened it into a single row with a display `name` and
+///     a short args/preview `context`. There are **no** `tool_calls` arrays or
+///     `tool_call_id` back-matching in this payload.
+///
+/// Mirrors the desktop TUI's `toTranscriptMessages` (`ui-tui/src/domain/messages.ts`).
+/// For each message, in order:
+///   1. an assistant **reasoning** row (from `reasoningText`), emitted as a completed
+///      `.reasoning` burst;
+///   2. an assistant / user **text** row from `displayText` (skipped when empty);
+///   3. a completed **tool** row for each `role: "tool"` entry (title = `context`, else `name`; detail =
+///      `context` preview + structured `args` + stored `content` + `inline_diff`, whichever
+///      the agent sent — `cookedToolDetail`).
+///
+/// Every row carries the message's server `timestamp` (when present) — display data for turn
+/// durations, never part of the id.
+///
+/// Identity is **deterministic and content-derived**: each row's `id` is a stable UUID
+/// hashed from its `(sequenceIndex, role, kindDiscriminator)` — NOT a fresh random UUID per
+/// call. So the same history in always yields byte-identical ids out (lets a diffing engine
+/// preserve scroll / animate inserts across a hydrate), identical consecutive rows stay
+/// distinct (sequence index), and a message and its reasoning row get distinct ids (distinct
+/// indices + discriminators). Mutable streaming text is excluded from the id so a live
+/// `message.delta` append later reconciles to the same id on the next hydrate.
+public func reconstructTranscript(_ messages: [SessionMessage]) -> [ChatRow] {
+  var rows: [ChatRow] = []
+
+  // Append a row, assigning its id deterministically from its ordinal position in the output
+  // transcript. Building the `Kind` first lets us read the role/discriminator the id derives
+  // from before the row exists.
+  func append(_ kind: ChatRow.Kind, timestamp: Date?) {
+    // Single source for role/discriminator: read them off the `Kind` so this never drifts from
+    // `ChatRow.kindDiscriminator` / `ChatRow.rowRole`. The timestamp is display data only —
+    // never part of the id.
+    let id = ChatRow.deterministicID(
+      sequenceIndex: rows.count, role: kind.role, kindDiscriminator: kind.discriminator
+    )
+    rows.append(ChatRow(id: id, kind: kind, timestamp: timestamp))
+  }
+
+  for message in messages {
+    // The server's authoring time (Unix seconds); a non-positive value is no time at all.
+    let timestamp = message.timestamp.flatMap { $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }
+    switch message.role {
+    case "tool":
+      // The server already resolved the call → result into one cooked row. The title is the
+      // `context` preview, else the name — the live `tool.start` shape, so the presentation
+      // reads a reloaded call's target the same way (an older agent's ONLY target).
+      let toolName = message.toolDisplayName ?? "tool"
+      append(.tool(
+        name: toolName, title: message.context?.trimmedNonEmpty ?? toolName, state: .complete,
+        detail: cookedToolDetail(message), durationS: nil
+      ), timestamp: timestamp)
+
+    case _ where !message.isPainted:
+      // Hidden scaffolding / a model-only merge: never shown.
+      continue
+
+    case _ where message.isTimelineNotice:
+      // A notice Hermes wrote itself (#124), stored as a user/assistant row: a status line,
+      // never a bubble the user (or the model) appears to have written.
+      append(
+        .status(kind: ChatRow.Kind.noticeStatusKind, text: timelineNoticeText(message)),
+        timestamp: timestamp
+      )
+
+    case "assistant":
+      // 1. Reasoning row (one completed burst per assistant message).
+      if let reasoning = message.reasoningText {
+        append(.reasoning(text: reasoning), timestamp: timestamp)
+      }
+      // 2. Assistant text row (the server omits empty/tool-only assistant turns, so a
+      //    missing body here just means there's nothing to render for it).
+      if let text = message.displayText {
+        append(.message(role: .assistant, text: text, isComplete: true), timestamp: timestamp)
+      }
+
+    case "user":
+      if let text = message.displayText {
+        append(.message(role: .user, text: text, isComplete: true), timestamp: timestamp)
+      }
+
+    default:
+      // Unknown / `system` role — mobile has no bubble for it; skip, never crash.
+      continue
+    }
+  }
+
+  return rows
+}
+
+/// `display_kind` values for rows Hermes wrote itself, not the user or the model: shown as a
+/// status line. Desktop `NOTICE_DISPLAY_KINDS` (`apps/desktop/src/lib/chat-messages/hydration.ts`).
+/// `steer` and `skill_invocation` are NOT here: they are the user's own words (the server
+/// already projects them to the visible text), so they stay user bubbles.
+let timelineNoticeDisplayKinds: Set<String> = [
+  "model_switch", "async_delegation_complete", "process_complete", "auto_continue",
+  "personality_switch", "failed_turn",
+]
+
+extension SessionMessage {
+  /// Whether the row paints at all: `hidden` rows, model-only merges
+  /// (`display_metadata.model_only`) and legacy heartbeat wakes don't (desktop `isPainted` +
+  /// `transcriptContent`).
+  var isPainted: Bool {
+    if displayKind == "hidden" { return false }
+    if displayMetadata?["model_only"]?.boolValue == true { return false }
+    if role == "user", displayKind == nil, let text = displayText, Self.isLegacyHeartbeat(text) {
+      return false
+    }
+    return true
+  }
+
+  /// A background-process heartbeat wake persisted by an agent older than the one that types it
+  /// `display_kind: "hidden"` — `[Background process <id> heartbeat #<n> …`: model scaffolding,
+  /// never a bubble (desktop `LEGACY_HEARTBEAT_ROW_RE`).
+  static func isLegacyHeartbeat(_ text: String) -> Bool {
+    let words = text.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ", maxSplits: 5)
+    guard words.count >= 5, words[0] == "[Background", words[1] == "process", words[3] == "heartbeat"
+    else { return false }
+    return words[4].first == "#" && words[4].dropFirst().allSatisfy(\.isNumber) && words[4].count > 1
+  }
+
+  /// A Hermes-authored notice (see ``timelineNoticeDisplayKinds``).
+  var isTimelineNotice: Bool { displayKind.map(timelineNoticeDisplayKinds.contains) ?? false }
+}
+
+/// The one-line text of a timeline notice — desktop `timelineDisplayContent`: the server's
+/// compact `display_metadata.display_text` when it sent one, else a fixed label. The row's own
+/// text is the model-facing payload (a whole subagent result), so it is shown only for a
+/// `failed_turn`, whose text IS the user-facing notice.
+func timelineNoticeText(kind: String?, metadata: JSONValue?, text: String?) -> String {
+  if let display = metadata?["display_text"]?.stringValue?.trimmedNonEmpty { return display }
+  switch kind {
+  case "model_switch": return "Model changed"
+  case "auto_continue": return "Resumed interrupted turn"
+  case "personality_switch": return "Personality changed"
+  case "async_delegation_complete":
+    guard let count = metadata?["task_count"]?.intValue else { return "Background agent work finished" }
+    return "\(count) background agent\(count == 1 ? "" : "s") finished"
+  case "process_complete": return "Background process finished"
+  default: return text?.trimmedNonEmpty ?? "Turn did not complete"
+  }
+}
+
+func timelineNoticeText(_ message: SessionMessage) -> String {
+  timelineNoticeText(kind: message.displayKind, metadata: message.displayMetadata, text: message.displayText)
+}
+
+/// The detail of a cooked `role:"tool"` history row: the structured `args` (newer agents), the
+/// stored result `content` (edit tools only), and the persisted `inline_diff` — the `context`
+/// preview is the row's title. The content mirrors the live `tool.complete` shape: always the
+/// raw text as `resultText`, plus the parsed JSON as `result` when it is a JSON object/array.
+/// An older agent's `{name, context}` row carries no detail → `nil`.
+func cookedToolDetail(_ message: SessionMessage) -> ToolDetail? {
+  let content = message.content?.nonEmpty
+  let detail = ToolDetail(
+    args: message.args?.nonNull,
+    result: content.flatMap(structuredJSON),
+    resultText: content,
+    inlineDiff: message.inlineDiff?.nonEmpty
+  )
+  return detail.isEmpty ? nil : detail
+}
+
+/// `text` parsed as JSON when it is a JSON object or array; `nil` for anything else (plain
+/// text, a bare scalar, malformed JSON) — the caller keeps the raw text either way.
+private func structuredJSON(_ text: String) -> JSONValue? {
+  switch JSONValue(parsing: text) {
+  case let value? where value.isObject || value.arrayValue != nil: value
+  default: nil
+  }
+}

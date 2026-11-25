@@ -1,0 +1,3617 @@
+import ComposableArchitecture
+import Foundation
+import Testing
+
+@testable import HermesKit
+
+@MainActor
+struct ChatReductionTests {
+  private let conn = ServerConnection(baseURL: URL(string: "http://mac.tailnet:9119")!, token: "t")
+  /// The `.bearer` twin of `conn`, for the #19 gated-regime reconnect tests.
+  private let bearerConn = ServerConnection(
+    baseURL: URL(string: "http://mac.tailnet:9119")!,
+    auth: .bearer(
+      BearerSession(
+        accessToken: "at", refreshToken: "rt", expiresAt: 0, provider: "nous", userID: "u-1"
+      )
+    )
+  )
+  private func uuid(_ n: Int) -> UUID {
+    UUID(uuidString: "00000000-0000-0000-0000-\(String(format: "%012x", n))")!
+  }
+  /// The pinned `date` for stores whose fold stamps live rows (`ChatRow.timestamp`).
+  private let t0 = Date(timeIntervalSince1970: 0)
+  private nonisolated static func at(_ seconds: TimeInterval) -> Date { Date(timeIntervalSince1970: seconds) }
+
+  // MARK: Streaming fold (no message id — single in-flight row)
+
+  @Test func streamingMessageFold() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    // message.start creates NO row (an empty assistant row would render as a blank bubble,
+    // and the turn timer is turn-level state) — it marks the turn live and starts the timer.
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.messageDelta(text: "Hel"))) {
+      $0.transcript = [
+        ChatRow(id: uuid(0), kind: .message(role: .assistant, text: "Hel", isComplete: false), timestamp: t0),
+      ]
+      $0.streamingRowID = uuid(0)
+    }
+    await store.send(.gatewayEvent(.messageDelta(text: "lo"))) {
+      $0.transcript[id: uuid(0)]?.kind = .message(role: .assistant, text: "Hello", isComplete: false)
+    }
+    await store.send(.gatewayEvent(.messageComplete(text: "Hello", usage: nil))) {
+      $0.transcript[id: uuid(0)]?.kind = .message(role: .assistant, text: "Hello", isComplete: true)
+      $0.streamingRowID = nil
+      $0.isTurnLive = false
+      $0.isSending = false
+    }
+  }
+
+  // Reasoning is one row per BURST, in arrival order: a tool or text row after a burst ends
+  // it (marked complete in place), and the next reasoning starts a fresh row. Nothing is
+  // reordered — there is no "keep last" pinning.
+  @Test func reasoningBurstsSplitAroundToolsAndText() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.reasoningDelta(text: "Hmm"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .reasoning(text: "Hmm"), timestamp: t0)]
+      $0.reasoningRowID = uuid(0)
+      $0.liveReasoningRowIDs = [uuid(0)]
+    }
+    // A tool starts: it closes the burst and lands after it.
+    await store.send(.gatewayEvent(.toolStart(toolID: "t1", name: "search", title: "Searching", argsText: nil))) {
+      $0.transcript = [
+        ChatRow(id: uuid(0), kind: .reasoning(text: "Hmm"), timestamp: t0),
+        ChatRow(id: uuid(1), kind: .tool(name: "search", title: "Searching", state: .running, detail: nil, durationS: nil), timestamp: t0),
+      ]
+      $0.reasoningRowID = nil
+      $0.toolRowIDs["t1"] = uuid(1)
+    }
+    // Reasoning after the tool is a NEW burst (a new row), not appended to the first.
+    await store.send(.gatewayEvent(.reasoningDelta(text: "Again"))) {
+      $0.transcript.append(ChatRow(id: uuid(2), kind: .reasoning(text: "Again"), timestamp: t0))
+      $0.reasoningRowID = uuid(2)
+      $0.liveReasoningRowIDs.insert(uuid(2))
+    }
+    await store.send(.gatewayEvent(.reasoningDelta(text: "!"))) {
+      $0.transcript[id: uuid(2)]?.kind = .reasoning(text: "Again!")
+    }
+    // The answer streams in: it closes the second burst and lands last.
+    await store.send(.gatewayEvent(.messageDelta(text: "Answer"))) {
+      $0.transcript[id: uuid(2)]?.kind = .reasoning(text: "Again!")
+      $0.transcript.append(ChatRow(id: uuid(3), kind: .message(role: .assistant, text: "Answer", isComplete: false), timestamp: t0))
+      $0.reasoningRowID = nil
+      $0.streamingRowID = uuid(3)
+    }
+    await store.send(.gatewayEvent(.messageComplete(text: "Answer", usage: nil))) {
+      $0.transcript[id: uuid(3)]?.kind = .message(role: .assistant, text: "Answer", isComplete: true)
+      $0.streamingRowID = nil
+      $0.isTurnLive = false
+      $0.isSending = false
+      // The finished turn's tool + reasoning rows are history: a later running hydrate must
+      // not re-append them.
+      $0.toolRowIDs = [:]
+      $0.liveReasoningRowIDs = []
+    }
+    #expect(store.state.transcript.map(\.id) == [uuid(0), uuid(1), uuid(2), uuid(3)])
+  }
+
+  @Test func toolOnlyTurnLeavesNoEmptyMessageBubble() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    // start → (tool activity) → complete with no text and no reasoning: no row at all.
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.messageComplete(text: "", usage: nil))) {
+      $0.isTurnLive = false
+      $0.isSending = false
+    }
+    #expect(store.state.transcript.isEmpty)
+  }
+
+  // MARK: Interim segments (`message.interim`)
+
+  // Commentary beside tool calls is its own row: `message.interim` seals the streaming
+  // segment (authoritative text, complete), so the deltas after the tools open a NEW row and
+  // `message.complete` lands on that final segment only — never on the sealed one. Every row
+  // is stamped at append and re-stamped when it completes.
+  @Test func interimSealThenFinalProducesTwoRowsAroundToolRows() async {
+    let now = LockIsolated(Date(timeIntervalSince1970: 10))
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = DateGenerator { now.value }
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.messageDelta(text: "Let me check"))) {
+      $0.transcript = [ChatRow(
+        id: uuid(0), kind: .message(role: .assistant, text: "Let me check", isComplete: false), timestamp: Self.at(10)
+      )]
+      $0.streamingRowID = uuid(0)
+    }
+    now.setValue(Self.at(12))
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "Let me check the tests.", alreadyStreamed: true, turnID: "turn-1", segment: 0
+    ))) {
+      // Sealed in place with the authoritative text; the segment is closed.
+      $0.transcript[id: uuid(0)]?.kind = .message(role: .assistant, text: "Let me check the tests.", isComplete: true)
+      $0.transcript[id: uuid(0)]?.timestamp = Self.at(12)
+      $0.streamingRowID = nil
+      $0.sealedSegments = [.init(turnID: "turn-1", segment: 0)]
+      $0.liveCommentaryRowIDs = [uuid(0)]
+    }
+    now.setValue(Self.at(13))
+    await store.send(.gatewayEvent(.toolStart(toolID: "t1", name: "terminal", title: "pytest -q", argsText: nil))) {
+      $0.transcript.append(ChatRow(
+        id: uuid(1), kind: .tool(name: "terminal", title: "pytest -q", state: .running, detail: nil, durationS: nil),
+        timestamp: Self.at(13)
+      ))
+      $0.toolRowIDs["t1"] = uuid(1)
+    }
+    now.setValue(Self.at(20))
+    await store.send(.gatewayEvent(.toolComplete(
+      toolID: "t1", name: "terminal", title: nil, args: nil, resultText: "3 passed", inlineDiff: nil, durationS: 7
+    ))) {
+      $0.transcript[id: uuid(1)]?.kind = .tool(
+        name: "terminal", title: "pytest -q", state: .complete,
+        detail: ToolDetail(resultText: "3 passed"), durationS: 7
+      )
+      $0.transcript[id: uuid(1)]?.timestamp = Self.at(20)
+    }
+    now.setValue(Self.at(21))
+    // The next delta opens a NEW segment row below the tool.
+    await store.send(.gatewayEvent(.messageDelta(text: "All green"))) {
+      $0.transcript.append(ChatRow(
+        id: uuid(2), kind: .message(role: .assistant, text: "All green", isComplete: false), timestamp: Self.at(21)
+      ))
+      $0.streamingRowID = uuid(2)
+    }
+    now.setValue(Self.at(25))
+    await store.send(.gatewayEvent(.messageComplete(text: "All green.", usage: nil))) {
+      $0.transcript[id: uuid(2)]?.kind = .message(role: .assistant, text: "All green.", isComplete: true)
+      $0.transcript[id: uuid(2)]?.timestamp = Self.at(25)
+      $0.streamingRowID = nil
+      $0.isTurnLive = false
+      $0.isSending = false
+      $0.toolRowIDs = [:]
+      $0.liveCommentaryRowIDs = []
+    }
+    // The sealed interim kept its own text: the final never overwrote it.
+    #expect(store.state.transcript.map(\.id) == [uuid(0), uuid(1), uuid(2)])
+    #expect(store.state.transcript[id: uuid(0)]?.copyText == "Let me check the tests.")
+  }
+
+  // A re-sent seal is a no-op: a stamped `(turn_id, segment)` already applied, or (unstamped)
+  // the same text as the turn's newest assistant row. A blank seal is a no-op too. A fresh
+  // un-streamed seal with no streaming row lands as a sealed row of its own.
+  @Test func resentSealIsNotDuplicated() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.messageDelta(text: "Checking"))) {
+      $0.transcript = [ChatRow(
+        id: uuid(0), kind: .message(role: .assistant, text: "Checking", isComplete: false), timestamp: t0
+      )]
+      $0.streamingRowID = uuid(0)
+    }
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "Checking", alreadyStreamed: true, turnID: "turn-1", segment: 0
+    ))) {
+      $0.transcript[id: uuid(0)]?.kind = .message(role: .assistant, text: "Checking", isComplete: true)
+      $0.streamingRowID = nil
+      $0.sealedSegments = [.init(turnID: "turn-1", segment: 0)]
+      $0.liveCommentaryRowIDs = [uuid(0)]
+    }
+    // The same stamped seal again (a second socket, a superseded attempt): nothing changes —
+    // even with different text.
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "Checking!", alreadyStreamed: true, turnID: "turn-1", segment: 0
+    )))
+    // An unstamped copy of the same text (older agent): the newest assistant row has it.
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "  Checking\n", alreadyStreamed: true, turnID: nil, segment: nil
+    )))
+    // Blank: nothing to seal.
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "  ", alreadyStreamed: false, turnID: "turn-1", segment: 1
+    )))
+    // A fresh un-streamed segment (no deltas preceded it) is appended, sealed.
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "Second thought.", alreadyStreamed: false, turnID: "turn-1", segment: 1
+    ))) {
+      $0.transcript.append(ChatRow(
+        id: uuid(1), kind: .message(role: .assistant, text: "Second thought.", isComplete: true), timestamp: t0
+      ))
+      $0.sealedSegments.insert(.init(turnID: "turn-1", segment: 1))
+      $0.liveCommentaryRowIDs.insert(uuid(1))
+    }
+    // A new turn forgets the previous turn's sealed segments.
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.sealedSegments = []
+    }
+    await store.send(.teardown)
+  }
+
+  // `message.complete` with no streaming row (a non-streamed reply) materialises the final
+  // row — unless it repeats a segment this turn already sealed: `response_reused`, or (older
+  // agents) the same text as the turn's newest assistant row. That sealed row IS the reply.
+  @Test func completeWithoutDeltasAppendsUnlessTheFinalWasAlreadySealed() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(t0)
+    }
+
+    // Turn 1: the answer is sealed before a housekeeping tool; the final reuses it.
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "Here is the answer.", alreadyStreamed: false, turnID: "turn-1", segment: 0
+    ))) {
+      $0.transcript = [ChatRow(
+        id: uuid(0), kind: .message(role: .assistant, text: "Here is the answer.", isComplete: true), timestamp: t0
+      )]
+      $0.sealedSegments = [.init(turnID: "turn-1", segment: 0)]
+      $0.liveCommentaryRowIDs = [uuid(0)]
+    }
+    await store.send(.gatewayEvent(.toolStart(toolID: "m", name: "memory", title: nil, argsText: nil))) {
+      $0.transcript.append(ChatRow(
+        id: uuid(1), kind: .tool(name: "memory", title: "memory", state: .running, detail: nil, durationS: nil),
+        timestamp: t0
+      ))
+      $0.toolRowIDs["m"] = uuid(1)
+    }
+    await store.send(.gatewayEvent(.messageComplete(text: "Here is the answer.", usage: nil, responseReused: true))) {
+      $0.isTurnLive = false
+      $0.isSending = false
+      $0.toolRowIDs = [:]
+      $0.liveCommentaryRowIDs = []
+    }
+    #expect(store.state.transcript.count == 2)
+
+    // Turn 2 (older agent, no flag): an identical final after the seal is not repainted.
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+      $0.sealedSegments = []
+    }
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "Done.", alreadyStreamed: false, turnID: nil, segment: nil
+    ))) {
+      $0.transcript.append(ChatRow(
+        id: uuid(2), kind: .message(role: .assistant, text: "Done.", isComplete: true), timestamp: t0
+      ))
+      $0.liveCommentaryRowIDs = [uuid(2)]
+    }
+    await store.send(.gatewayEvent(.messageComplete(text: "Done.", usage: nil))) {
+      $0.isTurnLive = false
+      $0.isSending = false
+      $0.liveCommentaryRowIDs = []
+    }
+
+    // Turn 3: a different, non-streamed final after a seal lands as its own row.
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "Looking.", alreadyStreamed: false, turnID: nil, segment: nil
+    ))) {
+      $0.transcript.append(ChatRow(
+        id: uuid(3), kind: .message(role: .assistant, text: "Looking.", isComplete: true), timestamp: t0
+      ))
+      $0.liveCommentaryRowIDs = [uuid(3)]
+    }
+    await store.send(.gatewayEvent(.messageComplete(text: "Found it.", usage: nil))) {
+      $0.transcript.append(ChatRow(
+        id: uuid(4), kind: .message(role: .assistant, text: "Found it.", isComplete: true), timestamp: t0
+      ))
+      $0.isTurnLive = false
+      $0.isSending = false
+      $0.liveCommentaryRowIDs = []
+    }
+  }
+
+  // A reused final over a still-streaming row keeps the streamed text (it already carries the
+  // reply) and completes the row in place.
+  @Test func reusedFinalOverTheStreamingRowKeepsTheStreamedText() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.messageDelta(text: "Here is the answer.\n\n"))) {
+      $0.transcript = [ChatRow(
+        id: uuid(0), kind: .message(role: .assistant, text: "Here is the answer.\n\n", isComplete: false), timestamp: t0
+      )]
+      $0.streamingRowID = uuid(0)
+    }
+    await store.send(.gatewayEvent(.messageComplete(text: "Here is the answer.", usage: nil, responseReused: true))) {
+      $0.transcript[id: uuid(0)]?.kind = .message(role: .assistant, text: "Here is the answer.\n\n", isComplete: true)
+      $0.streamingRowID = nil
+      $0.isTurnLive = false
+      $0.isSending = false
+    }
+  }
+
+  @Test(arguments: ["", " \n "])
+  func blankFinalKeepsTheStreamedReply(final: String) async {
+    // Bot mode withholds a silence marker and completes with "" — the streamed text stands.
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(t0)
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.gatewayEvent(.messageStart))
+    await store.send(.gatewayEvent(.messageDelta(text: "Paris.")))
+    await store.send(.gatewayEvent(.messageComplete(text: final, usage: nil, responseReused: false)))
+    #expect(Array(store.state.transcript) == [ChatRow(
+      id: uuid(0), kind: .message(role: .assistant, text: "Paris.", isComplete: true), timestamp: t0
+    )])
+    #expect(store.state.streamingRowID == nil)
+  }
+
+  @Test func reusedFinalAfterATrailingSegmentShowsTheAnswerOnceAndKeepsTheTrailingText() async {
+    // The answer was sealed before a housekeeping tool; a short segment streamed after it; the
+    // turn then ends on the REUSED answer. The answer stays where it was sealed (once), and the
+    // trailing segment keeps its own text instead of being overwritten by a second copy.
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(t0)
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.gatewayEvent(.messageStart))
+    await store.send(.gatewayEvent(.messageDelta(text: "Here is the answer.")))
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "Here is the answer.", alreadyStreamed: true, turnID: "t", segment: 0
+    )))
+    await store.send(.gatewayEvent(.toolStart(toolID: "m", name: "todo", title: nil, argsText: nil)))
+    await store.send(.gatewayEvent(.toolComplete(
+      toolID: "m", name: "todo", title: nil, args: nil, resultText: "ok", inlineDiff: nil, durationS: nil
+    )))
+    await store.send(.gatewayEvent(.messageDelta(text: "Done.")))
+    await store.send(.gatewayEvent(.messageComplete(text: "Here is the answer.", usage: nil, responseReused: true)))
+
+    let texts = store.state.transcript.compactMap { row -> String? in
+      if case let .message(.assistant, text, true) = row.kind { return text }
+      return nil
+    }
+    #expect(texts == ["Here is the answer.", "Done."])
+    #expect(store.state.streamingRowID == nil)
+  }
+
+  @Test func toolCompleteWithoutAStartClosesTheOpenBurstAndStampsTheRow() async {
+    let now = LockIsolated(Self.at(10))
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = DateGenerator { now.value }
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.gatewayEvent(.messageStart))
+    await store.send(.gatewayEvent(.reasoningDelta(text: "weighing")))
+    #expect(store.state.reasoningRowID == uuid(0))
+    now.setValue(Self.at(14))
+    await store.send(.gatewayEvent(.toolComplete(
+      toolID: "orphan", name: "terminal", title: "ls", args: nil, resultText: "a b", inlineDiff: nil, durationS: 1
+    )))
+    #expect(store.state.reasoningRowID == nil)
+    #expect(store.state.transcript[id: uuid(0)]?.timestamp == Self.at(14))
+    #expect(store.state.transcript[id: uuid(1)] == ChatRow(
+      id: uuid(1),
+      kind: .tool(name: "terminal", title: "ls", state: .complete, detail: ToolDetail(resultText: "a b"), durationS: 1),
+      timestamp: Self.at(14)
+    ))
+    // The burst is closed: more reasoning starts a new row after the tool.
+    await store.send(.gatewayEvent(.reasoningDelta(text: "next")))
+    #expect(store.state.transcript.count == 3)
+  }
+
+  @Test func aDetailSheetOpenOnARunningCallShowsItsCompletion() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(t0)
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.gatewayEvent(.messageStart))
+    await store.send(.gatewayEvent(.toolStart(toolID: "t1", name: "terminal", title: "pytest", argsText: nil)))
+    await store.send(.toolTapped(id: uuid(0)))
+    await store.send(.gatewayEvent(.toolComplete(
+      toolID: "t1", name: "terminal", title: nil, args: nil, resultText: "3 passed", inlineDiff: nil, durationS: 2
+    )))
+    #expect(store.state.presentedTool == store.state.transcript[id: uuid(0)])
+    guard case let .tool(call)? = store.state.presentedTool?.kind else {
+      Issue.record("expected the presented tool row")
+      return
+    }
+    #expect(call.state == .complete)
+    #expect(call.detail?.resultText == "3 passed")
+  }
+
+  // message.start starts the turn timer WITHOUT a row; ticks advance `turnSeconds`;
+  // reasoning deltas accumulate into one burst row; the turn completing closes the burst,
+  // cancels the timer and resets the counter.
+  @Test func messageStartStartsTurnTimerWithoutARowThenFreezes() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    // The 1s tick loop drives turnSeconds.
+    await clock.advance(by: .seconds(3))
+    await store.receive(\.turnTick) { $0.turnSeconds = 1 }
+    await store.receive(\.turnTick) { $0.turnSeconds = 2 }
+    await store.receive(\.turnTick) { $0.turnSeconds = 3 }
+    // Reasoning accumulates into one burst row, then the assistant message streams.
+    await store.send(.gatewayEvent(.reasoningDelta(text: "Thinking"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .reasoning(text: "Thinking"), timestamp: t0)]
+      $0.reasoningRowID = uuid(0)
+      $0.liveReasoningRowIDs = [uuid(0)]
+    }
+    await store.send(.gatewayEvent(.reasoningDelta(text: "…"))) {
+      $0.transcript[id: uuid(0)]?.kind = .reasoning(text: "Thinking…")
+    }
+    await store.send(.gatewayEvent(.messageDelta(text: "pong"))) {
+      $0.transcript[id: uuid(0)]?.kind = .reasoning(text: "Thinking…")
+      $0.transcript.append(ChatRow(id: uuid(1), kind: .message(role: .assistant, text: "pong", isComplete: false), timestamp: t0))
+      $0.reasoningRowID = nil
+      $0.streamingRowID = uuid(1)
+    }
+    // Completion cancels the timer and resets the turn state.
+    await store.send(.gatewayEvent(.messageComplete(text: "pong", usage: nil))) {
+      $0.transcript[id: uuid(1)]?.kind = .message(role: .assistant, text: "pong", isComplete: true)
+      $0.streamingRowID = nil
+      $0.isTurnLive = false
+      $0.turnSeconds = 0
+      $0.isSending = false
+      $0.liveReasoningRowIDs = []
+    }
+  }
+
+  // status.update is turn-level state (`turnStatus`), never a row; the terminal clears it.
+  @Test func statusUpdateIsTurnStateNotARow() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.statusUpdate(kind: "lifecycle", text: "Context: 42% used"))) {
+      $0.turnStatus = "Context: 42% used"
+    }
+    // The latest line replaces the previous one.
+    await store.send(.gatewayEvent(.statusUpdate(kind: "compress", text: "Compressing context"))) {
+      $0.turnStatus = "Compressing context"
+    }
+    await store.send(.gatewayEvent(.messageComplete(text: "", usage: nil))) {
+      $0.turnStatus = nil
+      $0.isTurnLive = false
+      $0.isSending = false
+    }
+    #expect(store.state.transcript.isEmpty)
+  }
+
+  // `thinking.delta` is the agent's spinner, NOT reasoning: each frame REPLACES the turn
+  // label (trimmed; blank → nil), never lands in a row, and is cleared by tool.start /
+  // message.delta / the terminal.
+  @Test func spinnerFramesReplaceTheTurnLabelAndNeverReachARow() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.spinnerFrame(text: "ಠ_ಠ pondering…"))) {
+      $0.turnActivityLabel = "ಠ_ಠ pondering…"
+    }
+    // A rewrite replaces (never appends), trimmed.
+    await store.send(.gatewayEvent(.spinnerFrame(text: "  ٩(๑❛ᴗ❛๑)۶ mulling…\n"))) {
+      $0.turnActivityLabel = "٩(๑❛ᴗ❛๑)۶ mulling…"
+    }
+    // A blank frame clears the label.
+    await store.send(.gatewayEvent(.spinnerFrame(text: "   "))) {
+      $0.turnActivityLabel = nil
+    }
+    await store.send(.gatewayEvent(.spinnerFrame(text: "(¬‿¬) cogitating…"))) {
+      $0.turnActivityLabel = "(¬‿¬) cogitating…"
+    }
+    // Real reasoning is a row; the label stands beside it.
+    await store.send(.gatewayEvent(.reasoningDelta(text: "real reasoning"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .reasoning(text: "real reasoning"), timestamp: t0)]
+      $0.reasoningRowID = uuid(0)
+      $0.liveReasoningRowIDs = [uuid(0)]
+    }
+    // tool.start clears the label.
+    await store.send(.gatewayEvent(.toolStart(toolID: "t1", name: "search", title: "Searching", argsText: nil))) {
+      $0.transcript[id: uuid(0)]?.kind = .reasoning(text: "real reasoning")
+      $0.transcript.append(ChatRow(id: uuid(1), kind: .tool(name: "search", title: "Searching", state: .running, detail: nil, durationS: nil), timestamp: t0))
+      $0.reasoningRowID = nil
+      $0.toolRowIDs["t1"] = uuid(1)
+      $0.turnActivityLabel = nil
+    }
+    await store.send(.gatewayEvent(.spinnerFrame(text: "ಠ_ಠ pondering…"))) {
+      $0.turnActivityLabel = "ಠ_ಠ pondering…"
+    }
+    // message.delta clears it too.
+    await store.send(.gatewayEvent(.messageDelta(text: "Done"))) {
+      $0.transcript.append(ChatRow(id: uuid(2), kind: .message(role: .assistant, text: "Done", isComplete: false), timestamp: t0))
+      $0.streamingRowID = uuid(2)
+      $0.turnActivityLabel = nil
+    }
+    await store.send(.gatewayEvent(.spinnerFrame(text: "ಠ_ಠ pondering…"))) {
+      $0.turnActivityLabel = "ಠ_ಠ pondering…"
+    }
+    // …and so does the terminal.
+    await store.send(.gatewayEvent(.messageComplete(text: "Done", usage: nil))) {
+      $0.transcript[id: uuid(2)]?.kind = .message(role: .assistant, text: "Done", isComplete: true)
+      $0.streamingRowID = nil
+      $0.turnActivityLabel = nil
+      $0.isTurnLive = false
+      $0.isSending = false
+      $0.toolRowIDs = [:]
+      $0.liveReasoningRowIDs = []
+    }
+    // No spinner text ever reached a row.
+    #expect(!store.state.transcript.contains { row in
+      ["pondering", "mulling", "cogitating"].contains { row.copyText.contains($0) }
+    })
+  }
+
+  // `reasoning.available` carries a response's whole reasoning when it was not streamed.
+  // Scoped to the open burst: a re-send of text the burst already holds is skipped; new text
+  // lands like a delta; after the burst ended it starts a new one.
+  @Test func reasoningAvailableDedupsWithinTheOpenBurst() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.reasoningDelta(text: "weighing options"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .reasoning(text: "weighing options"), timestamp: t0)]
+      $0.reasoningRowID = uuid(0)
+      $0.liveReasoningRowIDs = [uuid(0)]
+    }
+    // Already in the open burst → no change.
+    await store.send(.gatewayEvent(.reasoningAvailable(text: "weighing options\n")))
+    // New text appends to the open burst.
+    await store.send(.gatewayEvent(.reasoningAvailable(text: " then acting"))) {
+      $0.transcript[id: uuid(0)]?.kind = .reasoning(text: "weighing options then acting")
+    }
+    await store.send(.gatewayEvent(.toolStart(toolID: "t1", name: "grep", title: nil, argsText: nil))) {
+      $0.transcript[id: uuid(0)]?.kind = .reasoning(text: "weighing options then acting")
+      $0.transcript.append(ChatRow(id: uuid(1), kind: .tool(name: "grep", title: "grep", state: .running, detail: nil, durationS: nil), timestamp: t0))
+      $0.reasoningRowID = nil
+      $0.toolRowIDs["t1"] = uuid(1)
+    }
+    // The burst ended: the same text is a NEW burst, not a duplicate of the closed one.
+    await store.send(.gatewayEvent(.reasoningAvailable(text: "weighing options"))) {
+      $0.transcript.append(ChatRow(id: uuid(2), kind: .reasoning(text: "weighing options"), timestamp: t0))
+      $0.reasoningRowID = uuid(2)
+      $0.liveReasoningRowIDs.insert(uuid(2))
+    }
+    // Empty reasoning never creates a row.
+    await store.send(.gatewayEvent(.reasoningDelta(text: "")))
+    await store.send(.teardown)
+  }
+
+  // Slot teardown mid-turn cancels the live turn timer (no leaked tick loop).
+  @Test func teardownCancelsTurnTimer() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.turnTick) { $0.turnSeconds = 1 }
+    // Teardown cancels the loop; advancing further yields no more ticks.
+    await store.send(.teardown)
+    await clock.advance(by: .seconds(5))
+  }
+
+  // Background-grace expiry: `.teardownSocketOnly` cancels the socket effect WITHOUT its
+  // trailing `.gatewayClosed` (so no backoff reconnect is scheduled while suspended) and
+  // leaves the in-flight turn state intact — open reasoning burst, pointers, `isSending` —
+  // for the #26-preserving foreground hydrate. Only the status flips to `.reconnecting`
+  // (the socket is genuinely gone, so a later `.reattached` redials instead of hydrating
+  // a dead socket).
+  @Test func teardownSocketOnlyKeepsInFlightStateAndSkipsBackoff() async {
+    let clock = TestClock()
+    let socketClosed = LockIsolated(false)
+    var initial = ChatFeature.State(connection: conn)
+    // Seed the hydrate guard as a `.ready` would have left it, so `.teardownSocketOnly`'s
+    // reset (the next `.ready` must genuinely re-hydrate) is observable below.
+    initial.hasRequestedSession = true
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+      $0.hermesGateway.connect = { @Sendable _, _ in
+        AsyncStream { continuation in
+          continuation.onTermination = { _ in socketClosed.setValue(true) }
+        }
+      }
+    }
+
+    await store.send(.task) {
+      $0.isOnScreen = true
+      $0.hasStarted = true
+    }
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.reasoningDelta(text: "Hmm"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .reasoning(text: "Hmm"), timestamp: t0)]
+      $0.reasoningRowID = uuid(0)
+      $0.liveReasoningRowIDs = [uuid(0)]
+    }
+
+    await store.send(.teardownSocketOnly) {
+      $0.status = .reconnecting
+      $0.hasRequestedSession = false
+    }
+    // The socket effect terminated by CANCELLATION — the exhaustive store proves the
+    // trailing `.gatewayClosed` was dropped (no reconnect backoff, no in-flight finalize).
+    await waitUntil { socketClosed.value }
+    #expect(store.state.isSending)
+    #expect(store.state.isTurnLive)
+    #expect(store.state.reasoningRowID == uuid(0))
+
+    // The turn ticker deliberately stays (the hydrate's `reconcileTimer` owns it);
+    // full teardown cleans it up.
+    await store.send(.teardown)
+  }
+
+  // `.viewDisappeared` (the screen left — forwarded by `AppFeature.chatViewDisappeared`)
+  // releases only the VIEW-session resources: recording state reset + mic released. The
+  // slot's long-running effects are untouched — the turn ticker (a stand-in for the
+  // socket/persist effects rooted alongside it) keeps firing after the view is gone.
+  @Test func viewDisappearedReleasesMicButKeepsSlotEffects() async {
+    let clock = TestClock()
+    let micCancelled = LockIsolated(false)
+    var initial = ChatFeature.State(connection: conn)
+    initial.recording = .recording
+    initial.waveformLevels = [0.4, 0.8]
+    initial.recordingSeconds = 7
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.audioRecorder.cancel = { micCancelled.setValue(true) }
+    }
+
+    // A turn is running: the elapsed ticker is a slot-rooted effect.
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+
+    await store.send(.viewDisappeared) {
+      $0.recording = .idle
+      $0.waveformLevels = []
+      $0.recordingSeconds = 0
+    }
+    // The mic/recording session was released…
+    await waitUntil { micCancelled.value }
+    // …but the slot's effects survived the view: the ticker still fires.
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.turnTick) { $0.turnSeconds = 1 }
+
+    await store.send(.teardown)
+  }
+
+  // Two back-to-back turns: the timer restarts cleanly from 0 (cancelInFlight + reset) for
+  // the second turn — no double-ticking — and the first turn's burst stays closed.
+  @Test func secondMessageStartRestartsTimerFromZero() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    // Turn 1: start, accumulate reasoning, tick twice, then complete normally.
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.reasoningDelta(text: "First"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .reasoning(text: "First"), timestamp: t0)]
+      $0.reasoningRowID = uuid(0)
+      $0.liveReasoningRowIDs = [uuid(0)]
+    }
+    await clock.advance(by: .seconds(2))
+    await store.receive(\.turnTick) { $0.turnSeconds = 1 }
+    await store.receive(\.turnTick) { $0.turnSeconds = 2 }
+    await store.send(.gatewayEvent(.messageComplete(text: "done", usage: nil))) {
+      // A non-streamed reply lands after the burst, which closes.
+      $0.transcript = [
+        ChatRow(id: uuid(0), kind: .reasoning(text: "First"), timestamp: t0),
+        ChatRow(id: uuid(1), kind: .message(role: .assistant, text: "done", isComplete: true), timestamp: t0),
+      ]
+      $0.reasoningRowID = nil
+      $0.liveReasoningRowIDs = []
+      $0.isTurnLive = false
+      $0.turnSeconds = 0
+      $0.isSending = false
+    }
+
+    // Turn 2: a fresh message.start restarts the timer at 0; exactly one tick per second
+    // (no leaked first-turn loop double-ticking).
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.turnTick) { $0.turnSeconds = 1 }
+    await store.send(.teardown)
+    await clock.advance(by: .seconds(3))
+  }
+
+  // Defensive: a second message.start with the first turn's burst still OPEN (no
+  // message.complete in between) closes it rather than leaving it live forever, and resets
+  // the timer + label + status for the new turn.
+  @Test func secondMessageStartFreezesAStillOpenBurst() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.reasoningDelta(text: "Live one"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .reasoning(text: "Live one"), timestamp: t0)]
+      $0.reasoningRowID = uuid(0)
+      $0.liveReasoningRowIDs = [uuid(0)]
+    }
+    await store.send(.gatewayEvent(.spinnerFrame(text: "ಠ_ಠ pondering…"))) {
+      $0.turnActivityLabel = "ಠ_ಠ pondering…"
+    }
+    await store.send(.gatewayEvent(.statusUpdate(kind: "lifecycle", text: "Context: 42% used"))) {
+      $0.turnStatus = "Context: 42% used"
+    }
+    await clock.advance(by: .seconds(2))
+    await store.receive(\.turnTick) { $0.turnSeconds = 1 }
+    await store.receive(\.turnTick) { $0.turnSeconds = 2 }
+
+    // No message.complete arrives — a fresh message.start closes the orphaned burst and
+    // resets the turn state; the turn stays live.
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.transcript[id: uuid(0)]?.kind = .reasoning(text: "Live one")
+      $0.reasoningRowID = nil
+      $0.turnSeconds = 0
+      $0.turnActivityLabel = nil
+      $0.turnStatus = nil
+    }
+    // The next reasoning is a new burst for the new turn.
+    await store.send(.gatewayEvent(.reasoningDelta(text: "Second"))) {
+      $0.transcript.append(ChatRow(id: uuid(1), kind: .reasoning(text: "Second"), timestamp: t0))
+      $0.reasoningRowID = uuid(1)
+      $0.liveReasoningRowIDs.insert(uuid(1))
+    }
+    await store.send(.teardown)
+    await clock.advance(by: .seconds(3))
+  }
+
+  // `.error` ends the turn: the open burst closes, the timer is cancelled and the counter,
+  // label and status reset.
+  @Test func errorFreezesTurnAndCancelsTimer() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    await store.send(.gatewayEvent(.reasoningDelta(text: "Hmm"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .reasoning(text: "Hmm"), timestamp: t0)]
+      $0.reasoningRowID = uuid(0)
+      $0.liveReasoningRowIDs = [uuid(0)]
+    }
+    await store.send(.gatewayEvent(.spinnerFrame(text: "ಠ_ಠ pondering…"))) {
+      $0.turnActivityLabel = "ಠ_ಠ pondering…"
+    }
+    await clock.advance(by: .seconds(2))
+    await store.receive(\.turnTick) { $0.turnSeconds = 1 }
+    await store.receive(\.turnTick) { $0.turnSeconds = 2 }
+    // A leaked tick would fail the test.
+    await store.send(.gatewayEvent(.error(message: "boom"))) {
+      $0.errorBanner = "boom"
+      $0.transcript[id: uuid(0)]?.kind = .reasoning(text: "Hmm")
+      $0.reasoningRowID = nil
+      $0.liveReasoningRowIDs = []
+      $0.isTurnLive = false
+      $0.turnSeconds = 0
+      $0.turnActivityLabel = nil
+      $0.isSending = false
+    }
+    await clock.advance(by: .seconds(5))
+  }
+
+  // A socket drop finalizes the live turn: the open burst closes and every turn-level field
+  // resets, so nothing stays live on a dead socket.
+  @Test func socketDropClosesOpenBurstAndResetsTurn() async {
+    let clock = TestClock()
+    var initial = ChatFeature.State(connection: conn, status: .ready)
+    initial.transcript = [
+      ChatRow(id: uuid(0), kind: .reasoning(text: "Hmm")),
+    ]
+    initial.reasoningRowID = uuid(0)
+    initial.isTurnLive = true
+    initial.turnSeconds = 4
+    initial.turnActivityLabel = "ಠ_ಠ pondering…"
+    initial.turnStatus = "Context: 42% used"
+    initial.isSending = true
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.continuousClock = clock
+      $0.uuid = .incrementing
+      $0.date = .constant(t0)
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { _ in } }
+    }
+
+    await store.send(.gatewayClosed) {
+      $0.status = .reconnecting
+      $0.transcript[id: self.uuid(0)]?.kind = .reasoning(text: "Hmm")
+      // Closing the burst stamps it.
+      $0.transcript[id: self.uuid(0)]?.timestamp = self.t0
+      $0.reasoningRowID = nil
+      $0.isTurnLive = false
+      $0.turnSeconds = 0
+      $0.turnActivityLabel = nil
+      $0.turnStatus = nil
+      $0.isSending = false
+      $0.reconnectAttempt = 1
+    }
+    await store.send(.teardown)
+  }
+
+  // A bare reasoning delta arriving FIRST (no prior message.start) still creates its burst
+  // row — reasoning never drops — but does NOT start the timer (that's tied to
+  // message.start / a running hydrate), so no tick effect leaks.
+  @Test func bareReasoningDeltaCreatesBurstWithoutStartingTimer() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.reasoningDelta(text: "Orphan reasoning"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .reasoning(text: "Orphan reasoning"), timestamp: t0)]
+      $0.reasoningRowID = uuid(0)
+      $0.liveReasoningRowIDs = [uuid(0)]
+    }
+    // No timer was started by a bare delta — advancing the clock yields no ticks.
+    await clock.advance(by: .seconds(3))
+    #expect(store.state.turnSeconds == 0)
+    #expect(!store.state.isTurnLive)
+  }
+
+  // A burst is extended only while it is the LAST row: a status row (e.g. a timed-out card
+  // notice) landing after it ends the burst, so later reasoning opens a new row below it
+  // instead of growing a row that now sits above other content.
+  @Test func reasoningAfterAnInterveningRowStartsANewBurst() async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.transcript = [
+      ChatRow(id: uuid(100), kind: .reasoning(text: "first")),
+      ChatRow(id: uuid(101), kind: .status(kind: "approval", text: "Timed out")),
+    ]
+    initial.reasoningRowID = uuid(100)
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.reasoningDelta(text: "second"))) {
+      $0.transcript[id: self.uuid(100)]?.kind = .reasoning(text: "first")
+      $0.transcript[id: self.uuid(100)]?.timestamp = self.t0
+      $0.transcript.append(ChatRow(id: self.uuid(0), kind: .reasoning(text: "second"), timestamp: self.t0))
+      $0.reasoningRowID = self.uuid(0)
+      $0.liveReasoningRowIDs = [self.uuid(0)]
+    }
+  }
+
+  @Test func toolStartThenComplete() async {
+    let completedAt = Date(timeIntervalSince1970: 90)
+    let now = LockIsolated(t0)
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.date = DateGenerator { now.value }
+    }
+
+    await store.send(.gatewayEvent(.toolStart(toolID: "t1", name: "read_file", title: "Reading /x", argsText: "path=/x"))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .tool(
+        name: "read_file", title: "Reading /x", state: .running,
+        detail: ToolDetail(argsText: "path=/x"), durationS: nil
+      ), timestamp: t0)]
+      $0.toolRowIDs = ["t1": uuid(0)]
+    }
+    now.setValue(completedAt)
+    await store.send(.gatewayEvent(.toolComplete(
+      toolID: "t1", name: "read_file", title: "Read 12 lines",
+      args: .object(["path": .string("/x")]), resultText: "ok", inlineDiff: nil, durationS: 1.5,
+      result: .object(["content": .string("ok")])
+    ))) {
+      // Merge keeps the start-time args_text; fills in result + structured args; the
+      // completion re-stamps the row.
+      $0.transcript[id: uuid(0)]?.kind = .tool(
+        name: "read_file", title: "Read 12 lines", state: .complete,
+        detail: ToolDetail(
+          argsText: "path=/x", args: .object(["path": .string("/x")]),
+          result: .object(["content": .string("ok")]), resultText: "ok", inlineDiff: nil
+        ),
+        durationS: 1.5
+      )
+      $0.transcript[id: uuid(0)]?.timestamp = completedAt
+    }
+  }
+
+  // `tool.start` carries the call's full structured `args`; a `tool.complete` that omits
+  // them (or sends JSON null) keeps the start-time args, while its structured `result` fills
+  // in. A complete that DOES carry args wins.
+  @Test func toolArgsFromStartSurviveCompleteWithoutArgs() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.date = .constant(t0)
+    }
+    let args: JSONValue = .object(["command": .string("pytest -q")])
+    let result: JSONValue = .object(["exit_code": .number(0), "output": .string("3 passed")])
+
+    await store.send(.gatewayEvent(.toolStart(
+      toolID: "t1", name: "terminal", title: "pytest -q", argsText: nil, args: args
+    ))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .tool(
+        name: "terminal", title: "pytest -q", state: .running,
+        detail: ToolDetail(args: args), durationS: nil
+      ), timestamp: t0)]
+      $0.toolRowIDs = ["t1": uuid(0)]
+    }
+    await store.send(.gatewayEvent(.toolComplete(
+      toolID: "t1", name: "terminal", title: nil, args: .null, resultText: nil, inlineDiff: nil,
+      durationS: 2, result: result
+    ))) {
+      $0.transcript[id: uuid(0)]?.kind = .tool(
+        name: "terminal", title: "pytest -q", state: .complete,
+        detail: ToolDetail(args: args, result: result), durationS: 2
+      )
+    }
+
+    // A second call whose completion carries its own args: those win.
+    let completeArgs: JSONValue = .object(["command": .string("ls")])
+    await store.send(.gatewayEvent(.toolStart(
+      toolID: "t2", name: "terminal", title: nil, argsText: nil, args: .object(["command": .string("l")])
+    ))) {
+      $0.transcript.append(ChatRow(id: uuid(1), kind: .tool(
+        name: "terminal", title: "terminal", state: .running,
+        detail: ToolDetail(args: .object(["command": .string("l")])), durationS: nil
+      ), timestamp: t0))
+      $0.toolRowIDs["t2"] = uuid(1)
+    }
+    await store.send(.gatewayEvent(.toolComplete(
+      toolID: "t2", name: nil, title: nil, args: completeArgs, resultText: nil, inlineDiff: nil, durationS: nil
+    ))) {
+      $0.transcript[id: uuid(1)]?.kind = .tool(
+        name: "terminal", title: "terminal", state: .complete,
+        detail: ToolDetail(args: completeArgs), durationS: nil
+      )
+    }
+  }
+
+  @Test func toolTitleFallsBackToNameAndTapPresentsDetail() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.date = .constant(t0)
+    }
+
+    // No context/summary → title falls back to the raw tool name.
+    await store.send(.gatewayEvent(.toolStart(toolID: "t1", name: "grep", title: nil, argsText: nil))) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .tool(
+        name: "grep", title: "grep", state: .running, detail: nil, durationS: nil
+      ), timestamp: t0)]
+      $0.toolRowIDs = ["t1": uuid(0)]
+    }
+    await store.send(.gatewayEvent(.toolComplete(
+      toolID: "t1", name: "grep", title: nil, args: nil, resultText: "2 matches", inlineDiff: nil, durationS: 0.2
+    ))) {
+      $0.transcript[id: self.uuid(0)]?.kind = .tool(
+        name: "grep", title: "grep", state: .complete,
+        detail: ToolDetail(resultText: "2 matches"), durationS: 0.2
+      )
+    }
+    await store.send(.toolTapped(id: uuid(0))) {
+      $0.presentedTool = $0.transcript[id: self.uuid(0)]
+    }
+    await store.send(.toolDetailDismissed) {
+      $0.presentedTool = nil
+    }
+  }
+
+  // statusUpdate with no message.start still lands (turn-level, never a row); .error then
+  // clears it and surfaces the banner. A blank line clears the status.
+  @Test func statusUpdateWithoutATurnSetsStatusAndErrorClearsIt() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: { $0.uuid = .incrementing }
+
+    await store.send(.gatewayEvent(.statusUpdate(kind: "lifecycle", text: "searching…"))) {
+      $0.turnStatus = "searching…"
+    }
+    await store.send(.gatewayEvent(.statusUpdate(kind: "lifecycle", text: ""))) {
+      $0.turnStatus = nil
+    }
+    await store.send(.gatewayEvent(.statusUpdate(kind: "lifecycle", text: "searching…"))) {
+      $0.turnStatus = "searching…"
+    }
+    await store.send(.gatewayEvent(.error(message: "boom"))) {
+      $0.errorBanner = "boom"
+      $0.turnStatus = nil
+    }
+    #expect(store.state.transcript.isEmpty)
+  }
+
+  // MARK: Composer
+
+  @Test func composerSubmitAppendsUserRowAndSends() async {
+    var initial = ChatFeature.State(connection: conn, status: .ready)
+    initial.liveSessionID = "live"
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable _, _ in .object(["status": .string("streaming")]) }
+    }
+
+    await store.send(\.binding.composerText, "hello") { $0.composerText = "hello" }
+    await store.send(.composerSubmitted) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .message(role: .user, text: "hello", isComplete: true), timestamp: t0)]
+      $0.composerText = ""
+      $0.isSending = true
+    }
+  }
+
+  // Leading/trailing whitespace and newlines are trimmed before submit (#31); interior
+  // formatting is preserved. The trimmed text is both what's echoed in the user row and
+  // what goes out on the wire.
+  @Test func composerSubmitTrimsLeadingTrailingWhitespaceAndNewlines() async {
+    let sentText = LockIsolated<String?>(nil)
+    var initial = ChatFeature.State(connection: conn, status: .ready)
+    initial.liveSessionID = "live"
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable _, params in
+        sentText.setValue(params["text"]?.stringValue)
+        return .object(["status": .string("streaming")])
+      }
+    }
+
+    let raw = "  \n\nline one\n\n  indented line two  \n \n"
+    let trimmed = "line one\n\n  indented line two"
+    await store.send(\.binding.composerText, raw) { $0.composerText = raw }
+    await store.send(.composerSubmitted) {
+      $0.transcript = [ChatRow(id: uuid(0), kind: .message(role: .user, text: trimmed, isComplete: true), timestamp: t0)]
+      $0.composerText = ""
+      $0.isSending = true
+    }
+    await store.finish()
+    #expect(sentText.value == trimmed)
+  }
+
+  // Whitespace-only input never submits: canSend is false, so composerSubmitted is a no-op
+  // (nothing sent, composer untouched).
+  @Test func composerSubmitIgnoresWhitespaceOnlyInput() async {
+    let didSend = LockIsolated(false)
+    var initial = ChatFeature.State(connection: conn, status: .ready)
+    initial.liveSessionID = "live"
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    } withDependencies: {
+      $0.hermesGateway.send = { @Sendable _, _ in
+        didSend.setValue(true)
+        return .object(["status": .string("streaming")])
+      }
+    }
+
+    await store.send(\.binding.composerText, "  \n\n \t ") { $0.composerText = "  \n\n \t " }
+    #expect(store.state.canSend == false)
+    await store.send(.composerSubmitted)
+    #expect(didSend.value == false)
+  }
+
+  // A submit while a turn streams must never start a second in-flight submit (it would
+  // corrupt `isSending`, and if it later failed it would emit a spurious
+  // `runningChanged(false)` that tears down a detached slot whose first turn is still
+  // genuinely running). Since #66 the mid-turn draft QUEUES instead: no RPC, no transcript
+  // row — the entry drains through the normal pipeline once the turn ends.
+  @Test func submitWhileSendingQueuesInsteadOfSubmitting() async {
+    var initial = ChatFeature.State(connection: conn, status: .ready)
+    initial.liveSessionID = "live"
+    initial.composerText = "second message typed mid-turn"
+    initial.isSending = true
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    #expect(initial.canSend == false)
+    #expect(initial.canQueue == true)
+    await store.send(.composerSubmitted) {
+      $0.queuedPrompts = [
+        QueuedPrompt(id: self.uuid(0), text: "second message typed mid-turn")
+      ]
+      $0.composerText = ""
+    }
+  }
+
+  // MARK: Bootstrap (create on first ready)
+
+  @Test func createsSessionOnFirstReady() async {
+    let sent = LockIsolated<JSONValue?>(nil)
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = ImmediateClock()
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { $0.yield(GatewayFrame(.ready)) } }
+      $0.hermesGateway.send = { @Sendable method, params in
+        // The async slash-catalog fetch (#36) fires after create resolves — don't let it
+        // clobber the recorded `session.create` call this test asserts on.
+        if method != "commands.catalog" {
+          sent.setValue(.object(["method": .string(method), "params": params]))
+        }
+        return .object([
+          "session_id": .string("live123"),
+          "stored_session_id": .string("stored123"),
+          "message_count": .number(0),
+        ])
+      }
+    }
+
+    await store.send(.task) {
+      $0.isOnScreen = true
+      $0.hasStarted = true
+    }
+    await store.receive(\.gatewayFrame) {
+      $0.status = .ready
+      $0.hasRequestedSession = true
+    }
+    await store.receive(\.sessionResult.success) {
+      $0.liveSessionID = "live123"
+      $0.storedSessionID = "stored123"
+      $0.status = .ready
+      $0.hasHydrated = true
+      $0.awaitsFirstPersist = true // the minted key has no row yet (#132)
+    }
+    // New sessions create with no title so the server auto-names from the first message.
+    #expect(sent.value?["method"]?.stringValue == "session.create")
+    #expect(sent.value?["params"] == .object([:]))
+    #expect(sent.value?["params"]?["title"] == nil)
+    await store.send(.teardown)
+  }
+
+  @Test func createUnderCustomProfileThreadsProfileParam() async {
+    let sent = LockIsolated<JSONValue?>(nil)
+    let store = TestStore(
+      initialState: ChatFeature.State(connection: conn, profileName: "work")
+    ) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = ImmediateClock()
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { $0.yield(GatewayFrame(.ready)) } }
+      $0.hermesGateway.send = { @Sendable method, params in
+        // Ignore the async slash-catalog fetch (#36) — it must not clobber the recorded
+        // `session.create` call these assertions read.
+        if method != "commands.catalog" {
+          sent.setValue(.object(["method": .string(method), "params": params]))
+        }
+        return .object([
+          "session_id": .string("live123"),
+          "stored_session_id": .string("stored123"),
+          "message_count": .number(0),
+        ])
+      }
+    }
+
+    await store.send(.task) {
+      $0.isOnScreen = true
+      $0.hasStarted = true
+    }
+    await store.receive(\.gatewayFrame) {
+      $0.status = .ready
+      $0.hasRequestedSession = true
+    }
+    await store.receive(\.sessionResult.success) {
+      $0.liveSessionID = "live123"
+      $0.storedSessionID = "stored123"
+      $0.status = .ready
+      $0.hasHydrated = true
+      $0.awaitsFirstPersist = true // the minted key has no row yet (#132)
+    }
+    #expect(sent.value?["method"]?.stringValue == "session.create")
+    #expect(sent.value?["params"] == .object(["profile": .string("work")]))
+    await store.send(.teardown)
+  }
+
+  @Test func defaultProfileNameThreadsLiteralDefaultParam() async {
+    // #114: a profileName of "default" is sent LITERALLY — an omitted profile means the
+    // server's launch profile, not "default". Only nil (no profiles API) omits it, which
+    // `createsSessionOnFirstReady` pins as `params == {}`.
+    let sent = LockIsolated<JSONValue?>(nil)
+    let store = TestStore(
+      initialState: ChatFeature.State(connection: conn, profileName: "default")
+    ) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = ImmediateClock()
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { $0.yield(GatewayFrame(.ready)) } }
+      $0.hermesGateway.send = { @Sendable method, params in
+        // Ignore the async slash-catalog fetch (#36) — it must not clobber the recorded
+        // `session.create` call these assertions read.
+        if method != "commands.catalog" {
+          sent.setValue(.object(["method": .string(method), "params": params]))
+        }
+        return .object([
+          "session_id": .string("live123"),
+          "stored_session_id": .string("stored123"),
+          "message_count": .number(0),
+        ])
+      }
+    }
+
+    await store.send(.task) {
+      $0.isOnScreen = true
+      $0.hasStarted = true
+    }
+    await store.receive(\.gatewayFrame) {
+      $0.status = .ready
+      $0.hasRequestedSession = true
+    }
+    await store.receive(\.sessionResult.success) {
+      $0.liveSessionID = "live123"
+      $0.storedSessionID = "stored123"
+      $0.status = .ready
+      $0.hasHydrated = true
+      $0.awaitsFirstPersist = true // the minted key has no row yet (#132)
+    }
+    #expect(sent.value?["method"]?.stringValue == "session.create")
+    #expect(sent.value?["params"] == .object(["profile": .string("default")]))
+    await store.send(.teardown)
+  }
+
+  /// #114: the `.ready` hydrate's `session.resume` sends the literal `"default"`; a nil
+  /// profile (no profiles API) omits the key so those agents see byte-identical params.
+  @Test(arguments: [nil, "default"] as [String?])
+  func resumeThreadsLiteralDefaultOrOmitsWithoutProfilesAPI(profileName: String?) async {
+    let resumeParams = LockIsolated<JSONValue?>(nil)
+    let store = TestStore(
+      initialState: ChatFeature.State(
+        connection: conn, resumeStoredID: "stored123", profileName: profileName
+      )
+    ) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable method, params in
+        if method == "session.resume" { resumeParams.setValue(params) }
+        return .object([
+          "session_id": .string("live123"),
+          "stored_session_id": .string("stored123"),
+          "messages": .array([]),
+          "running": .bool(false),
+        ])
+      }
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.gatewayEvent(.ready))
+    await store.receive(\.activateResult.success)
+
+    var expected: [String: JSONValue] = ["session_id": .string("stored123")]
+    if let profileName { expected["profile"] = .string(profileName) }
+    #expect(resumeParams.value == .object(expected))
+    await store.send(.teardown)
+  }
+
+  @Test func resumeUnderCustomProfileThreadsProfileParam() async {
+    // A ready frame with a stored id hydrates via `session.resume`, threading the profile.
+    let activateParams = LockIsolated<JSONValue?>(nil)
+    let store = TestStore(
+      initialState: ChatFeature.State(connection: conn, resumeStoredID: "stored123", profileName: "work")
+    ) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable method, params in
+        if method == "session.resume" { activateParams.setValue(params) }
+        return .object([
+          "session_id": .string("live123"),
+          "stored_session_id": .string("stored123"),
+          "messages": .array([]),
+          "running": .bool(false),
+          "info": .object([
+            "model": .string("claude-opus-4-8"),
+            "usage": .object([
+              "context_used": .number(0), "context_max": .number(200_000), "context_percent": .number(0),
+            ]),
+          ]),
+        ])
+      }
+    }
+
+    await store.send(.gatewayEvent(.ready)) {
+      $0.status = .ready
+      $0.hasRequestedSession = true
+    }
+    await store.receive(\.activateResult.success) {
+      $0.liveSessionID = "live123"
+      $0.storedSessionID = "stored123"
+      $0.status = .ready
+      $0.hasHydrated = true
+      $0.model = "claude-opus-4-8"
+      $0.usage = Usage(contextUsed: 0, contextMax: 200_000, contextPercent: 0)
+    }
+    #expect(activateParams.value == .object([
+      "session_id": .string("stored123"),
+      "profile": .string("work"),
+    ]))
+    // Activate's authoritative `running:false` clears the list glow for this session.
+    await store.receive(\.delegate.runningChanged)
+    await store.send(.teardown)
+  }
+
+  @Test func readyWithStoredIDHydratesViaResume() async {
+    // A ready frame *with* a stored id must hydrate via `session.resume` (not create).
+    // The resume response carries model + usage directly — no separate usage fetch.
+    let methods = LockIsolated<[String]>([])
+    let store = TestStore(initialState: ChatFeature.State(connection: conn, resumeStoredID: "stored123")) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable method, _ in
+        methods.withValue { $0.append(method) }
+        return .object([
+          "session_id": .string("live123"),
+          "stored_session_id": .string("stored123"),
+          "messages": .array([]),
+          "running": .bool(false),
+          "info": .object([
+            "model": .string("claude-opus-4-8"),
+            "usage": .object([
+              "input": .number(120_000), "output": .number(30_000), "total": .number(150_000),
+              "context_used": .number(150_000), "context_max": .number(200_000), "context_percent": .number(75),
+            ]),
+          ]),
+        ])
+      }
+    }
+
+    await store.send(.gatewayEvent(.ready)) {
+      $0.status = .ready
+      $0.hasRequestedSession = true
+    }
+    await store.receive(\.activateResult.success) {
+      $0.liveSessionID = "live123"
+      $0.storedSessionID = "stored123"
+      $0.status = .ready
+      $0.hasHydrated = true
+      $0.model = "claude-opus-4-8"
+      $0.usage = Usage(
+        input: 120_000, output: 30_000, total: 150_000,
+        contextUsed: 150_000, contextMax: 200_000, contextPercent: 75
+      )
+    }
+    // Hydrate itself is the single `session.resume` (the trailing slash-catalog fetch, #36,
+    // is a separate concern) — no activate, and no fallback `session.usage` fetch.
+    #expect(methods.value.filter { $0 != "commands.catalog" } == ["session.resume"])
+    #expect(!methods.value.contains("session.usage"))
+    await store.receive(\.delegate.runningChanged)
+    await store.send(.teardown)
+  }
+
+  @Test func resumeWithNoUsageInResponseFallsBackToUsageFetch() async {
+    // An older agent's resume response may omit usage; we then fetch it on-demand
+    // so the gauge isn't blank until the next turn (preserves prior resume behavior).
+    let methods = LockIsolated<[String]>([])
+    let usageParams = LockIsolated<JSONValue?>(nil)
+    let store = TestStore(initialState: ChatFeature.State(connection: conn, resumeStoredID: "stored123")) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable method, params in
+        methods.withValue { $0.append(method) }
+        if method == "session.usage" {
+          usageParams.setValue(params)
+          return .object([
+            "context_used": .number(150_000), "context_max": .number(200_000), "context_percent": .number(75),
+          ])
+        }
+        // No `info`/`usage` in the resume response.
+        return .object([
+          "session_id": .string("live123"),
+          "stored_session_id": .string("stored123"),
+          "messages": .array([]),
+          "running": .bool(false),
+        ])
+      }
+    }
+
+    await store.send(.gatewayEvent(.ready)) {
+      $0.status = .ready
+      $0.hasRequestedSession = true
+    }
+    await store.receive(\.activateResult.success) {
+      $0.liveSessionID = "live123"
+      $0.storedSessionID = "stored123"
+      $0.status = .ready
+      $0.hasHydrated = true
+    }
+    // The synchronous delegate send lands before the async usage fetch resolves.
+    await store.receive(\.delegate.runningChanged)
+    await store.receive(\.usageResponse) {
+      $0.usage = Usage(contextUsed: 150_000, contextMax: 200_000, contextPercent: 75)
+    }
+    #expect(methods.value.first == "session.resume")
+    #expect(methods.value.contains("session.usage"))
+    #expect(usageParams.value?["session_id"]?.stringValue == "live123")
+    await store.send(.teardown)
+  }
+
+  @Test func resumeHydratesStoredTranscriptModelAndUsage() async {
+    // `session.resume` is the single hydrate call (it serves both stored and live sessions);
+    // it must rebuild the transcript from `messages` and apply model/usage. Regression guard
+    // for the blocker where `session.activate` (live-only) 404'd every stored session.
+    let methods = LockIsolated<[String]>([])
+    let store = TestStore(initialState: ChatFeature.State(connection: conn, resumeStoredID: "stored123")) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable method, _ in
+        methods.withValue { $0.append(method) }
+        // `session.resume` returns the live id under `session_id` and the stored id under
+        // `resumed` (no `stored_session_id`) — exercises the `resumed` decode fallback.
+        return .object([
+          "session_id": .string("live123"),
+          "resumed": .string("stored123"),
+          "messages": .array([
+            .object(["id": .number(1), "role": .string("user"), "content": .string("hi")]),
+            .object(["id": .number(2), "role": .string("assistant"), "content": .string("hello")]),
+          ]),
+          "running": .bool(false),
+          "info": .object([
+            "model": .string("claude-opus-4-8"),
+            "usage": .object(["context_used": .number(10), "context_max": .number(200_000), "context_percent": .number(0)]),
+          ]),
+        ])
+      }
+    }
+
+    await store.send(.gatewayEvent(.ready)) {
+      $0.status = .ready
+      $0.hasRequestedSession = true
+    }
+    await store.receive(\.activateResult.success) {
+      $0.liveSessionID = "live123"
+      $0.storedSessionID = "stored123"
+      $0.status = .ready
+      $0.hasHydrated = true
+      $0.spokenAssistantCount = 1 // the first hydrate arms the read-aloud anchor (#74)
+      $0.model = "claude-opus-4-8"
+      $0.usage = Usage(contextUsed: 10, contextMax: 200_000, contextPercent: 0)
+      // Rows carry deterministic, content-derived ids (matching `reconstructTranscript`).
+      $0.transcript = IdentifiedArrayOf(uniqueElements: reconstructTranscript([
+        SessionMessage(id: 1, role: "user", content: "hi"),
+        SessionMessage(id: 2, role: "assistant", content: "hello"),
+      ]))
+    }
+    // Single resume call — no activate, no fallback dance. (The trailing slash-catalog
+    // fetch, #36, is a separate concern.)
+    #expect(methods.value.filter { $0 != "commands.catalog" } == ["session.resume"])
+    await store.receive(\.delegate.runningChanged)
+    await store.send(.teardown)
+  }
+
+  @Test func activateSeedsRunningInflightAndDeltaReusesSeededRow() async {
+    // Regression: re-opening a session mid-turn must set the working indicator from
+    // `running`, seed the inflight user + streaming assistant rows, and a subsequent
+    // `message.delta` must append to the SEEDED streaming row (not create a duplicate).
+    let store = TestStore(initialState: ChatFeature.State(connection: conn, resumeStoredID: "stored123")) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable _, _ in
+        .object([
+          "session_id": .string("live123"),
+          "stored_session_id": .string("stored123"),
+          "messages": .array([]),
+          "running": .bool(true),
+          "info": .object([
+            "model": .string("claude-opus-4-8"),
+            "usage": .object(["context_used": .number(5), "context_max": .number(200_000), "context_percent": .number(0)]),
+          ]),
+          "inflight": .object([
+            "user": .string("explain this"),
+            "assistant": .string("Sure, "),
+            "streaming": .bool(true),
+          ]),
+        ])
+      }
+    }
+
+    await store.send(.gatewayEvent(.ready)) {
+      $0.status = .ready
+      $0.hasRequestedSession = true
+    }
+    await store.receive(\.activateResult.success) {
+      $0.liveSessionID = "live123"
+      $0.storedSessionID = "stored123"
+      $0.status = .ready
+      $0.hasHydrated = true
+      $0.model = "claude-opus-4-8"
+      $0.usage = Usage(contextUsed: 5, contextMax: 200_000, contextPercent: 0)
+      // running == true → working indicator on.
+      $0.isSending = true
+      // Inflight user row + seeded streaming assistant row; the turn is live with its timer
+      // reconciled (running with no anchor → ticks from 0) — no row for it. The seeded rows
+      // carry DETERMINISTIC, position-derived ids (review finding #4) — not fresh uuids — so
+      // repeated hydrates don't churn identity. Derived from their transcript positions (0/1).
+      let inflightUserID = ChatRow.deterministicID(sequenceIndex: 0, role: .user, kindDiscriminator: "message")
+      let inflightAssistantID = ChatRow.deterministicID(sequenceIndex: 1, role: .assistant, kindDiscriminator: "message")
+      $0.transcript = [
+        ChatRow(id: inflightUserID, kind: .message(role: .user, text: "explain this", isComplete: true)),
+        ChatRow(id: inflightAssistantID, kind: .message(role: .assistant, text: "Sure, ", isComplete: false)),
+      ]
+      $0.streamingRowID = inflightAssistantID
+      $0.isTurnLive = true
+    }
+    // Activate's authoritative `running:true` lights the list glow for this session.
+    await store.receive(\.delegate.runningChanged)
+    // The next delta appends to the seeded row — a SINGLE assistant row, no duplicate.
+    let inflightAssistantID = ChatRow.deterministicID(sequenceIndex: 1, role: .assistant, kindDiscriminator: "message")
+    await store.send(.gatewayEvent(.messageDelta(text: "here goes."))) {
+      $0.transcript[id: inflightAssistantID]?.kind = .message(role: .assistant, text: "Sure, here goes.", isComplete: false)
+    }
+    // user + assistant = 2 rows (no duplicate assistant from the delta).
+    #expect(store.state.transcript.count == 2)
+    await store.send(.teardown)
+  }
+
+  @Test func unknownEventIsInertInTheFold() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    }
+    // Forward-compat: events the UI doesn't model must not mutate state or crash.
+    await store.send(.gatewayEvent(.unknown(type: "tool.progress", raw: .object([:]))))
+  }
+
+  // MARK: Review summary (#47) — live-only system row
+
+  @Test func reviewSummaryAppendsStatusRowVerbatim() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+    }
+    // The wire text (💾 prefix included) lands verbatim in a bubble-less status row.
+    await store.send(.gatewayEvent(.reviewSummary(text: "💾 Self-improvement review: tightened the search prompt."))) {
+      $0.transcript = [
+        ChatRow(id: self.uuid(0), kind: .status(kind: "review", text: "💾 Self-improvement review: tightened the search prompt."))
+      ]
+    }
+  }
+
+  @Test func blankReviewSummaryIsDroppedWithoutPersist() async {
+    // Session ids are set so the persist gate at the `.gatewayEvent` wrapper is live: if a
+    // blank summary counted as persist-relevant, the exhaustive TestStore would fail on the
+    // scheduled (never-completed) debounce effect. Proves the fold no-op schedules nothing.
+    var initial = ChatFeature.State(connection: conn)
+    initial.liveSessionID = "live123"
+    initial.storedSessionID = "stored123"
+    initial.status = .ready
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    }
+    // A payload with no visible text must not render a blank caption row — neither empty
+    // nor whitespace-only (a whitespace row would paint as an invisible line).
+    await store.send(.gatewayEvent(.reviewSummary(text: "")))
+    await store.send(.gatewayEvent(.reviewSummary(text: " \n\t ")))
+  }
+
+  @Test func reviewSummaryMidTurnInterleavesWithStreaming() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+    }
+
+    await store.send(.gatewayEvent(.messageStart)) {
+      $0.isSending = true
+      $0.isTurnLive = true
+    }
+    // The turn is actively streaming when the summary lands: the first delta creates the
+    // in-flight assistant row.
+    await store.send(.gatewayEvent(.messageDelta(text: "Sure, "))) {
+      $0.transcript = [
+        ChatRow(id: uuid(0), kind: .message(role: .assistant, text: "Sure, ", isComplete: false), timestamp: t0),
+      ]
+      $0.streamingRowID = uuid(0)
+    }
+    // A summary arriving mid-turn slots in BELOW the partial assistant row.
+    await store.send(.gatewayEvent(.reviewSummary(text: "💾 Self-improvement review: noted."))) {
+      $0.transcript.append(ChatRow(id: uuid(1), kind: .status(kind: "review", text: "💾 Self-improvement review: noted.")))
+    }
+    // Later deltas keep mutating the SAME streaming row in place, above the summary — the
+    // summary must not capture or reorder the stream.
+    await store.send(.gatewayEvent(.messageDelta(text: "here goes."))) {
+      $0.transcript[id: self.uuid(0)]?.kind = .message(role: .assistant, text: "Sure, here goes.", isComplete: false)
+    }
+    #expect(store.state.transcript.map(\.id) == [uuid(0), uuid(1)])
+    // Turn ends: the answer + summary stay in order.
+    await store.send(.gatewayEvent(.messageComplete(text: "Sure, here goes.", usage: nil))) {
+      $0.transcript[id: self.uuid(0)]?.kind = .message(role: .assistant, text: "Sure, here goes.", isComplete: true)
+      $0.isTurnLive = false
+      $0.streamingRowID = nil
+      $0.isSending = false
+    }
+    #expect(store.state.transcript.map(\.id) == [uuid(0), uuid(1)])
+  }
+
+  @Test func reviewSummaryTriggersSnapshotPersist() async {
+    // The appended row must reach the snapshot cache (same debounced write-back as other
+    // transcript-changing events) so the next open paints it instantly.
+    let snapshotClient = ChatSnapshotClient.inMemory()
+    let clock = TestClock()
+    var initial = ChatFeature.State(connection: conn)
+    initial.liveSessionID = "live123"
+    initial.storedSessionID = "stored123"
+    initial.status = .ready
+
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(Date(timeIntervalSince1970: 123))
+      $0.chatSnapshot = snapshotClient
+    }
+
+    await store.send(.gatewayEvent(.reviewSummary(text: "💾 Self-improvement review: done."))) {
+      $0.transcript = [
+        ChatRow(id: self.uuid(0), kind: .status(kind: "review", text: "💾 Self-improvement review: done."))
+      ]
+    }
+    // Nothing persisted yet (still inside the debounce window).
+    #expect(snapshotClient.loadSnapshot("stored123") == nil)
+
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.persistSnapshotTick)
+
+    let saved = snapshotClient.loadSnapshot("stored123")
+    #expect(saved?.rows == [
+      ChatRow(id: self.uuid(0), kind: .status(kind: "review", text: "💾 Self-improvement review: done."))
+    ])
+
+    await store.send(.teardown)
+  }
+
+  @Test func interimSealTriggersSnapshotPersist() async {
+    let snapshotClient = ChatSnapshotClient.inMemory()
+    let clock = TestClock()
+    var initial = ChatFeature.State(connection: conn)
+    initial.liveSessionID = "live123"
+    initial.storedSessionID = "stored123"
+    initial.status = .ready
+
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = clock
+      $0.date = .constant(t0)
+      $0.chatSnapshot = snapshotClient
+    }
+
+    await store.send(.gatewayEvent(.messageInterim(
+      text: "Checking the logs.", alreadyStreamed: false, turnID: nil, segment: nil
+    ))) {
+      $0.transcript = [ChatRow(
+        id: self.uuid(0), kind: .message(role: .assistant, text: "Checking the logs.", isComplete: true), timestamp: self.t0
+      )]
+      $0.liveCommentaryRowIDs = [self.uuid(0)]
+    }
+    #expect(snapshotClient.loadSnapshot("stored123") == nil)
+
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.persistSnapshotTick)
+    #expect(snapshotClient.loadSnapshot("stored123")?.rows == Array(store.state.transcript))
+
+    await store.send(.teardown)
+  }
+
+  @Test func spinnerFramesAndStatusUpdatesDoNotPersist() async {
+    // Turn-level state, not rows: with the persist gate live (session ids set), a scheduled
+    // write-back would leave an in-flight debounce effect and fail this exhaustive store.
+    var initial = ChatFeature.State(connection: conn)
+    initial.liveSessionID = "live123"
+    initial.storedSessionID = "stored123"
+    initial.status = .ready
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    }
+
+    await store.send(.gatewayEvent(.spinnerFrame(text: "ಠ_ಠ pondering…"))) {
+      $0.turnActivityLabel = "ಠ_ಠ pondering…"
+    }
+    await store.send(.gatewayEvent(.statusUpdate(kind: "context", text: "Compacting…"))) {
+      $0.turnStatus = "Compacting…"
+    }
+  }
+
+  @Test func sessionInfoUpdatesModelAndReasoningChip() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    }
+    await store.send(.gatewayEvent(.sessionInfo(SessionInfo(model: "claude-opus-4-8", reasoningEffort: "high")))) {
+      $0.model = "claude-opus-4-8"
+      $0.reasoningEffort = "high"
+    }
+    // A later partial session.info (model only) must not clear the reasoning effort.
+    await store.send(.gatewayEvent(.sessionInfo(SessionInfo(model: "claude-sonnet-4-6")))) {
+      $0.model = "claude-sonnet-4-6"
+    }
+  }
+
+  // MARK: Context usage capture
+
+  @Test func sessionInfoCapturesUsage() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    }
+    let usage = Usage(contextUsed: 125_000, contextMax: 200_000, contextPercent: 62)
+    await store.send(.gatewayEvent(.sessionInfo(SessionInfo(model: "claude-opus-4-8", usage: usage)))) {
+      $0.model = "claude-opus-4-8"
+      $0.usage = usage
+    }
+  }
+
+  @Test func messageCompleteCapturesUsage() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.date = .constant(t0)
+    }
+    let usage = Usage(input: 800, output: 200, total: 1_000, contextUsed: 1_000, contextMax: 200_000, contextPercent: 1)
+    await store.send(.gatewayEvent(.messageComplete(text: "Hi", usage: usage))) {
+      $0.usage = usage
+      $0.transcript.append(
+        ChatRow(id: self.uuid(0), kind: .message(role: .assistant, text: "Hi", isComplete: true), timestamp: self.t0)
+      )
+      $0.isSending = false
+    }
+  }
+
+  @Test func partialSessionInfoDoesNotClobberUsage() async {
+    let usage = Usage(contextUsed: 125_000, contextMax: 200_000, contextPercent: 62)
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) {
+      ChatFeature()
+    }
+    await store.send(.gatewayEvent(.sessionInfo(SessionInfo(usage: usage)))) {
+      $0.usage = usage
+    }
+    // A later partial session.info (model only, no usage) must not clear the usage.
+    await store.send(.gatewayEvent(.sessionInfo(SessionInfo(model: "claude-sonnet-4-6")))) {
+      $0.model = "claude-sonnet-4-6"
+    }
+  }
+
+  // MARK: Reconnect / backoff
+
+  @Test func reconnectsAfterBackoffOnClose() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn, status: .ready)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.continuousClock = clock
+      $0.uuid = .incrementing
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { _ in } } // stays open
+    }
+
+    await store.send(.gatewayClosed) {
+      $0.status = .reconnecting
+      $0.reconnectAttempt = 1
+    }
+    await clock.advance(by: .seconds(1)) // first backoff = 2^0 = 1s
+    await store.receive(\.reconnectTick)
+    await store.send(.teardown)
+  }
+
+  // MARK: ws-ticket auth failure vs transient (gated reconnect)
+
+  /// A dead gated session (ws-ticket 401 → `.authExpired`) pauses reconnect: it emits the
+  /// `sessionExpired` delegate and the trailing `.gatewayClosed` (finished stream) does NOT
+  /// schedule a backoff reconnect.
+  @Test func authExpiredSignalsSessionExpiredAndPausesReconnect() async {
+    let clock = TestClock()
+    let cookieConn = ServerConnection(
+      baseURL: URL(string: "http://mac.tailnet:9119")!,
+      auth: .cookie(CookieSession(cookies: [], username: "alice", provider: "basic"))
+    )
+    let store = TestStore(initialState: ChatFeature.State(connection: cookieConn, status: .ready)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.continuousClock = clock
+      $0.uuid = .incrementing
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { _ in } }
+    }
+
+    await store.send(.gatewayEvent(.authExpired)) {
+      $0.awaitingReauth = true
+      $0.status = .reconnecting
+    }
+    await store.receive(\.delegate.sessionExpired)
+
+    // The stream finishing afterwards is suppressed — no reconnectAttempt bump, no backoff.
+    await store.send(.gatewayClosed)
+    // No `.reconnectTick` is ever scheduled even after a long advance.
+    await clock.advance(by: .seconds(60))
+    await store.send(.teardown)
+  }
+
+  /// A transient gated failure (the ticket mint failed → the stream just finishes, like a
+  /// dropped socket) continues the existing backoff/reconnect loop.
+  @Test func transientGatedCloseContinuesBackoff() async {
+    let clock = TestClock()
+    let cookieConn = ServerConnection(
+      baseURL: URL(string: "http://mac.tailnet:9119")!,
+      auth: .cookie(CookieSession(cookies: [], username: "alice", provider: "basic"))
+    )
+    let store = TestStore(initialState: ChatFeature.State(connection: cookieConn, status: .ready)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.continuousClock = clock
+      $0.uuid = .incrementing
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { _ in } }
+    }
+
+    await store.send(.gatewayClosed) {
+      $0.status = .reconnecting
+      $0.reconnectAttempt = 1
+    }
+    await clock.advance(by: .seconds(1)) // first backoff = 2^0 = 1s
+    await store.receive(\.reconnectTick)
+    await store.send(.teardown)
+  }
+
+  /// The `.bearer` twin of `authExpiredSignalsSessionExpiredAndPausesReconnect` (#19): a dead
+  /// refresh token makes `BearerTokenStore.validAccessToken` throw `authExpired`, the ticket
+  /// mint reports it, and the reducer must raise re-auth EXACTLY ONCE — the trailing
+  /// `.gatewayClosed` schedules no backoff, so a store that answers `authExpired` forever
+  /// cannot spin a redial/expire loop.
+  @Test func bearerAuthExpiredRaisesReauthOnceAndNeverRedials() async {
+    let clock = TestClock()
+    let dials = LockIsolated(0)
+    let store = TestStore(initialState: ChatFeature.State(connection: bearerConn, status: .ready)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.continuousClock = clock
+      $0.uuid = .incrementing
+      $0.hermesGateway.connect = { @Sendable _, _ in
+        dials.withValue { $0 += 1 }
+        return AsyncStream { _ in }
+      }
+    }
+
+    await store.send(.gatewayEvent(.authExpired)) {
+      $0.awaitingReauth = true
+      $0.status = .reconnecting
+    }
+    await store.receive(\.delegate.sessionExpired)
+
+    await store.send(.gatewayClosed)
+    await clock.advance(by: .seconds(600))
+    #expect(dials.value == 0, "a dead bearer pair must not be redialled behind the re-auth sheet")
+    await store.send(.teardown)
+  }
+
+  /// The `.bearer` twin of `transientGatedCloseContinuesBackoff` (#19). A refresh 503 keeps
+  /// the tokens (`BearerTokenStore` rethrows, nothing is cleared) and reaches the reducer as a
+  /// plain finished stream, which is what this drives: a bare close on a bearer connection
+  /// must back off and redial, never latch `awaitingReauth`. The mint itself lives in the live
+  /// gateway client and is not exercised here — only the reducer's verdict on its silence.
+  @Test func bearerCloseWithoutAnExpiryVerdictKeepsBackingOff() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: bearerConn, status: .ready)) {
+      ChatFeature()
+    } withDependencies: {
+      $0.continuousClock = clock
+      $0.uuid = .incrementing
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { _ in } }
+    }
+
+    await store.send(.gatewayClosed) {
+      $0.status = .reconnecting
+      $0.reconnectAttempt = 1
+    }
+    #expect(store.state.awaitingReauth == false) // NOT an expiry verdict
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.reconnectTick)
+    await store.send(.teardown)
+  }
+
+  // MARK: Reconnect resilience — finalize a row that was mid-stream when the socket dropped
+
+  @Test func closeFinalizesInFlightStreamingRow() async {
+    let clock = TestClock()
+    var initial = ChatFeature.State(connection: conn, status: .ready)
+    initial.transcript = [
+      ChatRow(id: uuid(0), kind: .reasoning(text: "Hmm")),
+      ChatRow(id: uuid(1), kind: .message(role: .assistant, text: "Half", isComplete: false)),
+    ]
+    initial.streamingRowID = uuid(1)
+    initial.isTurnLive = true
+    initial.turnSeconds = 7
+    initial.isSending = true
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.continuousClock = clock
+      $0.uuid = .incrementing
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { _ in } }
+    }
+
+    // A dropped socket finalizes the streaming message and freezes the live turn so nothing
+    // spins forever; the timer is cancelled.
+    await store.send(.gatewayClosed) {
+      $0.status = .reconnecting
+      $0.transcript[id: self.uuid(1)]?.kind = .message(role: .assistant, text: "Half", isComplete: true)
+      $0.streamingRowID = nil
+      $0.isTurnLive = false
+      $0.turnSeconds = 0
+      $0.isSending = false
+      $0.reconnectAttempt = 1
+      $0.spokenAssistantCount = 1 // the dropped partial is consumed, never read aloud (#74)
+    }
+    await store.send(.teardown)
+  }
+
+  // MARK: Copy a row to the pasteboard
+
+  @Test func copyRowPutsRawMarkdownOnPasteboardAndShowsThenClearsCheckmark() async {
+    let copied = LockIsolated<String?>(nil)
+    let clock = TestClock()
+    var initial = ChatFeature.State(connection: conn)
+    initial.transcript = [ChatRow(id: uuid(0), kind: .message(role: .assistant, text: "# copy **me**", isComplete: true))]
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.pasteboard.copy = { @Sendable text in copied.setValue(text) }
+      $0.continuousClock = clock
+    }
+
+    // The pasteboard gets the raw Markdown, and the row-scoped token drives the
+    // action bar's transient checkmark (#34).
+    await store.send(.copyRow(id: uuid(0))) {
+      $0.recentlyCopiedToken = ChatFeature.rowCopyToken(self.uuid(0))
+    }
+    #expect(copied.value == "# copy **me**")
+
+    await clock.advance(by: .seconds(1.5))
+    await store.receive(\.copyFeedbackExpired) {
+      $0.recentlyCopiedToken = nil
+    }
+  }
+
+  @Test func reCopyingARowRestartsTheFeedbackTimer() async {
+    let clock = TestClock()
+    var initial = ChatFeature.State(connection: conn)
+    initial.transcript = [
+      ChatRow(id: uuid(0), kind: .message(role: .assistant, text: "first", isComplete: true)),
+      ChatRow(id: uuid(1), kind: .message(role: .assistant, text: "second", isComplete: true)),
+    ]
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.pasteboard.copy = { @Sendable _ in }
+      $0.continuousClock = clock
+    }
+
+    await store.send(.copyRow(id: uuid(0))) {
+      $0.recentlyCopiedToken = ChatFeature.rowCopyToken(self.uuid(0))
+    }
+    // Copying another row before the first expiry cancels it (cancelInFlight) — the
+    // checkmark moves and only the second expiry arrives, 1.5s after the second copy.
+    await clock.advance(by: .seconds(1.0))
+    await store.send(.copyRow(id: uuid(1))) {
+      $0.recentlyCopiedToken = ChatFeature.rowCopyToken(self.uuid(1))
+    }
+    await clock.advance(by: .seconds(1.0)) // 2.0s after first copy — first timer is dead
+    await clock.advance(by: .seconds(0.5))
+    await store.receive(\.copyFeedbackExpired) { $0.recentlyCopiedToken = nil }
+  }
+
+  @Test func rowCopyCancelsPendingCodeCopyFeedback() async {
+    // Code-block copy and whole-row copy share one feedback slot (`CancelID.copyFeedback`):
+    // a row copy 1s after a code copy cancels the code timer — only ONE expiry arrives,
+    // 1.5s after the row copy, and the code token is gone the moment the row copy lands.
+    let clock = TestClock()
+    var initial = ChatFeature.State(connection: conn)
+    initial.transcript = [ChatRow(id: uuid(0), kind: .message(role: .assistant, text: "row text", isComplete: true))]
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.pasteboard.copy = { @Sendable _ in }
+      $0.continuousClock = clock
+    }
+
+    await store.send(.copyCode(text: "let x = 1", token: "code#0")) {
+      $0.recentlyCopiedToken = "code#0"
+    }
+    await clock.advance(by: .seconds(1.0))
+    await store.send(.copyRow(id: uuid(0))) {
+      $0.recentlyCopiedToken = ChatFeature.rowCopyToken(self.uuid(0))
+    }
+    // 1.5s after the FIRST copy — its timer is dead, nothing fires.
+    await clock.advance(by: .seconds(0.5))
+    // 1.5s after the row copy: the single surviving expiry clears the row token.
+    await clock.advance(by: .seconds(1.0))
+    await store.receive(\.copyFeedbackExpired) {
+      $0.recentlyCopiedToken = nil
+    }
+  }
+
+  @Test func copyUnknownRowIsNoOp() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() }
+    await store.send(.copyRow(id: uuid(9))) // no such row → no effect, no state change
+  }
+
+  @Test func copyEmptyTextRowIsNoOp() async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.transcript = [ChatRow(id: uuid(0), kind: .message(role: .assistant, text: "", isComplete: true))]
+    let store = TestStore(initialState: initial) { ChatFeature() }
+    await store.send(.copyRow(id: uuid(0))) // empty copyText → no pasteboard, no token
+  }
+
+  // MARK: Copy a code block with transient checkmark feedback (#9)
+
+  @Test func copyCodePutsTextOnPasteboardAndShowsThenClearsCheckmark() async {
+    let copied = LockIsolated<String?>(nil)
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.pasteboard.copy = { @Sendable text in copied.setValue(text) }
+      $0.continuousClock = clock
+    }
+
+    await store.send(.copyCode(text: "let x = 1", token: "row#0")) {
+      $0.recentlyCopiedToken = "row#0"
+    }
+    #expect(copied.value == "let x = 1")
+
+    await clock.advance(by: .seconds(1.5))
+    await store.receive(\.copyFeedbackExpired) {
+      $0.recentlyCopiedToken = nil
+    }
+  }
+
+  @Test func copyingAnotherBlockMovesTheCheckmarkAndRestartsTimer() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.pasteboard.copy = { @Sendable _ in }
+      $0.continuousClock = clock
+    }
+
+    await store.send(.copyCode(text: "a", token: "t1")) { $0.recentlyCopiedToken = "t1" }
+    // Re-tapping before the first timer fires cancels it (cancelInFlight) and the
+    // checkmark moves to the new block — only the second expiry arrives.
+    await store.send(.copyCode(text: "b", token: "t2")) { $0.recentlyCopiedToken = "t2" }
+
+    await clock.advance(by: .seconds(1.5))
+    await store.receive(\.copyFeedbackExpired) { $0.recentlyCopiedToken = nil }
+  }
+
+  @Test func copyEmptyCodeIsNoOp() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() }
+    await store.send(.copyCode(text: "", token: "t")) // guard → no effect, no state change
+  }
+
+  @Test func staleFeedbackExpiryDoesNotClearNewerCheckmark() async {
+    // A late expiry for an old token must not wipe a checkmark that has since moved.
+    var state = ChatFeature.State(connection: conn)
+    state.recentlyCopiedToken = "current"
+    let store = TestStore(initialState: state) { ChatFeature() }
+    await store.send(.copyFeedbackExpired(token: "stale")) // token mismatch → unchanged
+  }
+
+  // MARK: Voice input (#7)
+
+  /// Drive the common path up to an active recording with the test recorder's 3 canned
+  /// level samples already folded in. Caller owns the clock so the timer stays paused.
+  private func startRecording(_ store: TestStore<ChatFeature.State, ChatFeature.Action>) async {
+    await store.send(.voiceButtonTapped) { $0.recording = .requestingPermission }
+    await store.receive(\.recordingPermission)
+    await store.receive(\.recordingStarted) { $0.recording = .recording }
+    await store.receive(\.recordingLevel) { $0.waveformLevels = [0.2] }
+    await store.receive(\.recordingLevel) { $0.waveformLevels = [0.2, 0.6] }
+    await store.receive(\.recordingLevel) { $0.waveformLevels = [0.2, 0.6, 0.4] }
+  }
+
+  @Test func voiceRecordingTranscribesAndAppendsToComposer() async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.composerText = "draft"
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.continuousClock = TestClock() // unadvanced → recording timer never ticks here
+      $0.audioRecorder = .testValue
+      $0.hermesREST.transcribe = { @Sendable _, _, _ in "hello world" }
+    }
+
+    await startRecording(store)
+
+    await store.send(.voiceButtonTapped) { $0.recording = .transcribing }
+    await store.receive(\.recordingStopped)
+    await store.receive(\.transcriptionSucceeded) {
+      $0.recording = .idle
+      $0.waveformLevels = []
+      $0.composerText = "draft hello world" // appended with a separating space
+    }
+  }
+
+  @Test func voicePermissionDeniedShowsBanner() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.continuousClock = TestClock()
+      $0.audioRecorder = .testValue
+      $0.audioRecorder.requestPermission = { @Sendable in false }
+    }
+
+    await store.send(.voiceButtonTapped) { $0.recording = .requestingPermission }
+    await store.receive(\.recordingPermission) {
+      $0.recording = .idle
+      $0.errorBanner = "Microphone access is off. Enable it in Settings to use voice input."
+    }
+  }
+
+  @Test func voiceTranscriptionFailureSurfacesServerReason() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.continuousClock = TestClock()
+      $0.audioRecorder = .testValue
+      $0.hermesREST.transcribe = { @Sendable _, _, _ in throw RESTError.transcriptionFailed("no speech detected") }
+    }
+
+    await startRecording(store)
+
+    await store.send(.voiceButtonTapped) { $0.recording = .transcribing }
+    await store.receive(\.recordingStopped)
+    await store.receive(\.voiceInputFailed) {
+      $0.recording = .idle
+      $0.waveformLevels = []
+      $0.errorBanner = "no speech detected"
+    }
+  }
+
+  @Test func recordingTimerAdvancesElapsedSeconds() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.continuousClock = clock
+      $0.audioRecorder = .testValue
+    }
+
+    await startRecording(store)
+
+    await clock.advance(by: .seconds(2))
+    await store.receive(\.recordingTick) { $0.recordingSeconds = 1 }
+    await store.receive(\.recordingTick) { $0.recordingSeconds = 2 }
+
+    // Cancelling tears down the timer/levels and discards the recording.
+    await store.send(.recordingCancelled) {
+      $0.recording = .idle
+      $0.waveformLevels = []
+      $0.recordingSeconds = 0
+    }
+  }
+
+  // MARK: Launch action one-shot (#93 dictation, #138 camera / photos)
+
+  /// A slot carrying an intent's `pendingLaunchAction`, over a socket that never yields (the
+  /// connect effect is cancelled by `.teardown` at the end of each test). `dialed` records
+  /// that the first start still connected alongside the action; `opened` records every picker
+  /// the reducer opened (each returns one image, so a run is visible as `attachmentAdded`).
+  private func launchActionStore(
+    _ action: LaunchAction = .dictation,
+    recording: ChatFeature.State.RecordingState = .idle,
+    permission: Bool = true
+  ) -> (
+    store: TestStore<ChatFeature.State, ChatFeature.Action>,
+    dialed: LockIsolated<Bool>,
+    opened: LockIsolated<[String]>
+  ) {
+    var initial = ChatFeature.State(connection: conn)
+    initial.pendingLaunchAction = action
+    initial.recording = recording
+    let dialed = LockIsolated(false)
+    let opened = LockIsolated<[String]>([])
+    let picked = PickedItem(data: Data([1]), filename: "a.jpg", mimeType: "image/jpeg", kind: .image)
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.continuousClock = TestClock() // unadvanced → recording timer never ticks here
+      $0.uuid = .incrementing
+      $0.audioRecorder = .testValue
+      $0.audioRecorder.requestPermission = { @Sendable in permission }
+      $0.attachmentPicker.capturePhoto = { @Sendable in
+        opened.withValue { $0.append("camera") }
+        return PickedBatch(items: [picked])
+      }
+      $0.attachmentPicker.pickPhotos = { @Sendable in
+        opened.withValue { $0.append("photos") }
+        return PickedBatch(items: [picked])
+      }
+      $0.hermesGateway.connect = { @Sendable _, _ in
+        dialed.setValue(true)
+        return AsyncStream { _ in }
+      }
+    }
+    return (store, dialed, opened)
+  }
+
+  @Test func firstTaskWithPendingDictationStartsRecording() async {
+    let (store, dialed, opened) = launchActionStore()
+
+    // Consumed at first start, alongside the connect — not on a later `.ready`.
+    await store.send(.task) {
+      $0.isOnScreen = true
+      $0.hasStarted = true
+      $0.pendingLaunchAction = nil
+      $0.recording = .requestingPermission
+    }
+    await store.receive(\.recordingPermission)
+    #expect(dialed.value, "the dictation never replaces the first-start connect")
+    await store.receive(\.recordingStarted) { $0.recording = .recording }
+    await store.receive(\.recordingLevel) { $0.waveformLevels = [0.2] }
+    await store.receive(\.recordingLevel) { $0.waveformLevels = [0.2, 0.6] }
+    await store.receive(\.recordingLevel) { $0.waveformLevels = [0.2, 0.6, 0.4] }
+
+    // A re-appearance (the `hasStarted` guard) never re-fires the dictation.
+    await store.send(.viewDisappeared) {
+      $0.isOnScreen = false
+      $0.recording = .idle
+      $0.waveformLevels = []
+    }
+    await store.send(.task) { $0.isOnScreen = true }
+    #expect(opened.value.isEmpty, "dictation opens no picker")
+
+    await store.send(.teardown)
+  }
+
+  @Test func pendingDictationPermissionDeniedShowsMicBanner() async {
+    let (store, dialed, _) = launchActionStore(permission: false)
+
+    await store.send(.task) {
+      $0.isOnScreen = true
+      $0.hasStarted = true
+      $0.pendingLaunchAction = nil
+      $0.recording = .requestingPermission
+    }
+    await store.receive(\.recordingPermission) {
+      $0.recording = .idle
+      $0.errorBanner = "Microphone access is off. Enable it in Settings to use voice input."
+    }
+    #expect(dialed.value)
+
+    await store.send(.teardown)
+  }
+
+  @Test func pendingDictationNeverTogglesAnActiveRecording() async {
+    let (store, _, _) = launchActionStore(recording: .recording)
+
+    // The action is cleared, but recording is NOT toggled off (no transcription hand-off).
+    await store.send(.task) {
+      $0.isOnScreen = true
+      $0.hasStarted = true
+      $0.pendingLaunchAction = nil
+    }
+
+    await store.send(.teardown) { $0.recording = .idle }
+  }
+
+  /// The camera / photos one-shot (#138) opens ITS picker exactly once at the first start,
+  /// alongside the connect, and stages what it returns; a re-appearance never re-fires it.
+  @Test(arguments: [LaunchAction.camera, .photos])
+  func firstTaskWithPendingPickerActionOpensThePickerOnce(action: LaunchAction) async {
+    let (store, dialed, opened) = launchActionStore(action)
+
+    await store.send(.task) {
+      $0.isOnScreen = true
+      $0.hasStarted = true
+      $0.pendingLaunchAction = nil
+    }
+    await store.receive(\.attachmentAdded) {
+      $0.attachments = [
+        PickedItem(data: Data([1]), filename: "a.jpg", mimeType: "image/jpeg", kind: .image)
+          .attachment(id: self.uuid(0))
+      ]
+    }
+    #expect(dialed.value, "the picker never replaces the first-start connect")
+    #expect(opened.value == [action == .camera ? "camera" : "photos"])
+    #expect(store.state.recording == .idle, "a picker action never starts the mic")
+
+    // A re-appearance (the `hasStarted` guard) never re-opens the picker.
+    await store.send(.viewDisappeared) { $0.isOnScreen = false }
+    await store.send(.task) { $0.isOnScreen = true }
+    #expect(opened.value.count == 1)
+
+    await store.send(.teardown)
+  }
+
+  /// A cancelled picker is the silent empty batch: nothing staged, no banner.
+  @Test(arguments: [LaunchAction.camera, .photos])
+  func pendingPickerActionCancelledStagesNothing(action: LaunchAction) async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.pendingLaunchAction = action
+    let opened = LockIsolated<[String]>([])
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+      $0.attachmentPicker.capturePhoto = { @Sendable in // a cancel
+        opened.withValue { $0.append("camera") }
+        return PickedBatch()
+      }
+      $0.attachmentPicker.pickPhotos = { @Sendable in
+        opened.withValue { $0.append("photos") }
+        return PickedBatch()
+      }
+      $0.hermesGateway.connect = { @Sendable _, _ in AsyncStream { _ in } }
+    }
+
+    await store.send(.task) {
+      $0.isOnScreen = true
+      $0.hasStarted = true
+      $0.pendingLaunchAction = nil
+    }
+    // The picker really ran (and was cancelled) before the store settles: nothing staged.
+    await waitUntil { !opened.value.isEmpty }
+    #expect(opened.value == [action == .camera ? "camera" : "photos"])
+    await store.send(.teardown)
+  }
+
+  /// The reused-seat path: an already-started slot runs the picker action at once.
+  @Test(arguments: [LaunchAction.camera, .photos])
+  func startLaunchActionOnStartedSlotOpensThePicker(action: LaunchAction) async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.hasStarted = true
+    let opened = LockIsolated<[String]>([])
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+      $0.attachmentPicker.capturePhoto = { @Sendable in
+        opened.withValue { $0.append("camera") }
+        return PickedBatch()
+      }
+      $0.attachmentPicker.pickPhotos = { @Sendable in
+        opened.withValue { $0.append("photos") }
+        return PickedBatch()
+      }
+    }
+
+    await store.send(.startLaunchAction(action))
+    await store.finish()
+    #expect(opened.value == [action == .camera ? "camera" : "photos"])
+  }
+
+  @Test func startLaunchActionDictationOnStartedSlotStartsOnlyFromIdle() async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.hasStarted = true
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.continuousClock = TestClock()
+      $0.audioRecorder = .testValue
+      $0.audioRecorder.requestPermission = { @Sendable in false }
+    }
+
+    await store.send(.startLaunchAction(.dictation)) {
+      $0.recording = .requestingPermission
+    }
+    await store.receive(\.recordingPermission) {
+      $0.recording = .idle
+      $0.errorBanner = "Microphone access is off. Enable it in Settings to use voice input."
+    }
+
+    // A recording the user already has going is never toggled.
+    initial.recording = .recording
+    let busy = TestStore(initialState: initial) { ChatFeature() }
+    await busy.send(.startLaunchAction(.dictation))
+  }
+
+  // MARK: Attachments (#8)
+
+  private func imageAttachment(_ n: Int) -> ComposerAttachment {
+    ComposerAttachment(
+      id: uuid(n), kind: .image, filename: "photo\(n).png",
+      mimeType: "image/png", data: Data([0x89, 0x50, UInt8(n)])
+    )
+  }
+
+  @Test func attachmentAddAndRemove() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() }
+    let a = imageAttachment(0)
+    let b = imageAttachment(1)
+    await store.send(.attachmentAdded(a)) { $0.attachments = [a] }
+    await store.send(.attachmentAdded(b)) { $0.attachments = [a, b] }
+    await store.send(.removeAttachment(id: a.id)) { $0.attachments = [b] }
+  }
+
+  @Test func attachmentOnlyMessageIsSendable() {
+    var state = ChatFeature.State(connection: conn)
+    state.liveSessionID = "live"
+    #expect(state.canSend == false) // empty text + no attachments
+    state.attachments = [imageAttachment(0)]
+    #expect(state.canSend == true) // an attachment alone is enough to send
+  }
+
+  @Test func pickingFilesAddsEachWithFreshIDs() async {
+    let picked = [
+      PickedItem(data: Data([1]), filename: "a.pdf", mimeType: "application/pdf", kind: .pdf),
+      PickedItem(data: Data([2]), filename: "b.txt", mimeType: "text/plain", kind: .file),
+    ]
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+      $0.attachmentPicker.pickFiles = { @Sendable in PickedBatch(items: picked) }
+    }
+
+    await store.send(.attachFilesTapped)
+    await store.receive(\.attachmentAdded) {
+      $0.attachments = [picked[0].attachment(id: self.uuid(0))]
+    }
+    await store.receive(\.attachmentAdded) {
+      $0.attachments = [picked[0].attachment(id: self.uuid(0)), picked[1].attachment(id: self.uuid(1))]
+    }
+  }
+
+  /// A picked photo that never loaded (an iCloud original that wouldn't download in time, a
+  /// type that couldn't be re-encoded) used to be a *silent* no-op: the sheet dismissed and
+  /// nothing appeared. The sheet can't distinguish that from a cancel on its own, so the
+  /// drop count does.
+  @Test func aPickThatLoadsNothingIsReported() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+      $0.attachmentPicker.pickPhotos = { @Sendable in PickedBatch(droppedCount: 1) }
+    }
+
+    await store.send(.attachPhotosTapped)
+    await store.receive(\.attachmentsDropped) {
+      $0.errorBanner = "Couldn’t add the selected item."
+    }
+  }
+
+  /// A partial loss is reported too — the chips that made it are staged first, so the banner
+  /// is about the ones that didn't.
+  @Test func aPartiallyLoadedPickStagesWhatSurvivedAndSaysWhatDidNot() async {
+    let picked = [PickedItem(data: Data([1]), filename: "a.png", mimeType: "image/png", kind: .image)]
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+      $0.attachmentPicker.pickPhotos = { @Sendable in PickedBatch(items: picked, droppedCount: 2) }
+    }
+
+    await store.send(.attachPhotosTapped)
+    await store.receive(\.attachmentAdded) {
+      $0.attachments = [picked[0].attachment(id: self.uuid(0))]
+    }
+    await store.receive(\.attachmentsDropped) {
+      $0.errorBanner = "Couldn’t add 2 of the selected items."
+    }
+  }
+
+  /// A re-pick that *works* takes the previous failure's banner down with it — the same rule a
+  /// successful paste follows. (The staging runs before the shortfall is reported, so the
+  /// partial-loss test above still ends with its banner up.)
+  @Test func aSuccessfulRePickClearsAStaleDropBanner() async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.errorBanner = "Couldn’t add the selected item."
+    let picked = [PickedItem(data: Data([1]), filename: "a.png", mimeType: "image/png", kind: .image)]
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+      $0.attachmentPicker.pickPhotos = { @Sendable in PickedBatch(items: picked) }
+    }
+
+    await store.send(.attachPhotosTapped)
+    await store.receive(\.attachmentAdded) {
+      $0.errorBanner = nil
+      $0.attachments = [picked[0].attachment(id: self.uuid(0))]
+    }
+  }
+
+  // MARK: Pasted images (#54)
+
+  private func pastedImage(_ n: Int) -> PickedItem {
+    PickedItem(
+      data: Data([0x89, 0x50, UInt8(n)]),
+      filename: n == 0 ? "pasted-image.png" : "pasted-image-\(n + 1).png",
+      mimeType: "image/png",
+      kind: .image
+    )
+  }
+
+  @Test func pastingImagesStagesThemInOrderWithFreshIDs() async {
+    let items = [pastedImage(0), pastedImage(1)]
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(items: items))) {
+      $0.pendingPasteCount = 0
+      $0.attachments = [
+        items[0].attachment(id: self.uuid(0)),
+        items[1].attachment(id: self.uuid(1)),
+      ]
+    }
+  }
+
+  @Test func pastingImagesAppendsAfterAlreadyStagedAttachments() async {
+    var initial = ChatFeature.State(connection: conn)
+    let existing = imageAttachment(9)
+    initial.attachments = [existing]
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    let pasted = pastedImage(0)
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(items: [pasted]))) {
+      $0.pendingPasteCount = 0
+      $0.attachments = [existing, pasted.attachment(id: self.uuid(0))]
+    }
+  }
+
+  /// The view only hands over a paste it *claimed* (the clipboard advertised an image), so an
+  /// empty batch means every provider failed to load or re-encode. iOS offered **Paste**, the
+  /// user tapped it — the one outcome that must not happen is silence.
+  @Test func pastingImagesThatAllFailedToLoadSurfacesABanner() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(droppedCount: 1))) {
+      $0.pendingPasteCount = 0
+      $0.errorBanner = "Couldn’t paste the image."
+    }
+    #expect(store.state.attachments.isEmpty)
+  }
+
+  /// …and a paste that *works* takes the stale banner down with it — a failure message left
+  /// hanging over a freshly staged chip reads as a verdict on that chip.
+  @Test func aSuccessfulPasteClearsAStaleBanner() async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.errorBanner = "Couldn’t paste the image."
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    let pasted = pastedImage(0)
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(items: [pasted]))) {
+      $0.pendingPasteCount = 0
+      $0.errorBanner = nil
+      $0.attachments = [pasted.attachment(id: self.uuid(0))]
+    }
+  }
+
+  /// …except when the agent can't take attachments at all: that flip banners its own
+  /// explanation, and a second one on top would be noise.
+  @Test func pastingNothingIsSilentWhenAttachmentsUnsupported() async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.attachmentsUnsupported = true
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(droppedCount: 1))) { $0.pendingPasteCount = 0 }
+  }
+
+  @Test func pastingImagesIsIgnoredWhenAttachmentsUnsupported() async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.attachmentsUnsupported = true
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+    // Backstop for the window the view's own gate can't cover (the capability can flip while
+    // the pasted providers are still loading): nothing staged.
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(items: [pastedImage(0), pastedImage(1)]))) {
+      $0.pendingPasteCount = 0
+    }
+  }
+
+  /// A paste that only *partly* survived says so. Only the survivors used to come back, so a
+  /// three-image paste that yielded two was indistinguishable from a two-image paste — and the
+  /// user sent an incomplete set believing it complete. The banner lands **after** the staging,
+  /// so it is not the chips' own clear that wipes it.
+  @Test func aPartiallyLostPasteStagesWhatSurvivedAndSaysSo() async {
+    let pasted = pastedImage(0)
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(items: [pasted], droppedCount: 2))) {
+      $0.pendingPasteCount = 0
+      $0.attachments = [pasted.attachment(id: self.uuid(0))]
+      $0.errorBanner = "Couldn’t paste 2 of the images."
+    }
+  }
+
+  @Test func aSinglyLostPasteIsWordedInTheSingular() async {
+    let pasted = pastedImage(0)
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(items: [pasted], droppedCount: 1))) {
+      $0.pendingPasteCount = 0
+      $0.attachments = [pasted.attachment(id: self.uuid(0))]
+      $0.errorBanner = "Couldn’t paste 1 of the images."
+    }
+  }
+
+  /// A paste is the one attachment source with no modal sheet over it: the composer, with the
+  /// user's typed text already in it, stays fully interactive while the clipboard providers
+  /// load. Submitting in that window shipped the message *without* the image, which then
+  /// reappeared orphaned in the next draft.
+  @Test func aPasteInFlightBlocksSubmissionUntilItLands() async {
+    var initial = ChatFeature.State(connection: conn, status: .ready)
+    initial.liveSessionID = "live"
+    initial.composerText = "look at this"
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+    #expect(store.state.canSend)
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    #expect(!store.state.canSend, "Send has to wait for the bytes it is meant to carry")
+    // A submit racing the load is a no-op — the text stays put rather than going out alone.
+    await store.send(.composerSubmitted)
+    #expect(store.state.composerText == "look at this")
+
+    let pasted = pastedImage(0)
+    await store.send(.attachmentsPasted(PickedBatch(items: [pasted]))) {
+      $0.pendingPasteCount = 0
+      $0.attachments = [pasted.attachment(id: self.uuid(0))]
+    }
+    #expect(store.state.canSend)
+  }
+
+  /// Two fast pastes are both outstanding at once (the view's coordinator chains their loads),
+  /// which is why the gate is a counter: a `Bool` would unlock on the first delivery while the
+  /// second batch was still loading.
+  @Test func overlappingPastesEachHoldTheGate() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 2 }
+
+    let first = pastedImage(0)
+    await store.send(.attachmentsPasted(PickedBatch(items: [first]))) {
+      $0.pendingPasteCount = 1
+      $0.attachments = [first.attachment(id: self.uuid(0))]
+    }
+    let second = pastedImage(1)
+    await store.send(.attachmentsPasted(PickedBatch(items: [second]))) {
+      $0.pendingPasteCount = 0
+      $0.attachments.append(second.attachment(id: self.uuid(1)))
+    }
+  }
+
+  /// The gate is released on **every** terminal outcome, not just the happy one — a paste that
+  /// loaded nothing, or one that arrived after the capability was withdrawn, must not leave the
+  /// composer locked for the rest of the session.
+  @Test func theGateIsReleasedByAPasteThatStagesNothing() async {
+    var initial = ChatFeature.State(connection: conn)
+    initial.attachmentsUnsupported = true
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(droppedCount: 1))) { $0.pendingPasteCount = 0 }
+  }
+
+  /// A batch that arrives at a chat which never pasted is **not this chat's** and is dropped.
+  /// The paste load is the one attachment source outside TCA's effect lifecycle — the pickers
+  /// are `.run` effects that `ifLet` cancels on teardown, while the coordinator's `Task`
+  /// delivers unconditionally through the store `ChatView` captured, which the root's
+  /// `ifLet(\.liveChat)` routes to whatever chat now occupies the slot. Over the whole load
+  /// window (up to `clipboardLoadTimeout`) an idle pop + open, a push tap (#32) or a branch
+  /// creation can have replaced it, and without the pairing check the image would silently
+  /// appear in — and upload to — a conversation it was never pasted into.
+  @Test func aPasteBatchFromAnotherChatIsIgnored() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    // No `attachmentsPasting`: nothing staged, no banner, and the gate stays where it was.
+    await store.send(.attachmentsPasted(PickedBatch(items: [pastedImage(0)], droppedCount: 1)))
+    #expect(store.state.attachments.isEmpty)
+    #expect(store.state.errorBanner == nil)
+    #expect(store.state.pendingPasteCount == 0)
+  }
+
+  /// …and a stray batch can't rob a paste this chat *is* waiting on: it is dropped whole
+  /// rather than decrementing someone else's gate.
+  @Test func aStrayPasteBatchDoesNotConsumeThisChatsPendingPaste() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+    }
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    let mine = pastedImage(0)
+    await store.send(.attachmentsPasted(PickedBatch(items: [mine]))) {
+      $0.pendingPasteCount = 0
+      $0.attachments = [mine.attachment(id: self.uuid(0))]
+    }
+    // The other chat's batch, arriving late: the staged attachments are untouched.
+    await store.send(.attachmentsPasted(PickedBatch(items: [pastedImage(1)])))
+    #expect(store.state.attachments.count == 1)
+  }
+
+  /// The pasted→uploaded path end to end: a `PickedItem` handed over by the paste coordinator
+  /// is staged and then uploaded through the same `image.attach_bytes` hop a picked photo uses.
+  @Test func pastedImagesUploadOnSubmitLikePickedOnes() async {
+    let methods = LockIsolated<[String]>([])
+    let pasted = pastedImage(0)
+    var initial = ChatFeature.State(connection: conn, status: .ready)
+    initial.liveSessionID = "live"
+    initial.composerText = "look"
+    let store = TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable method, _ in
+        methods.withValue { $0.append(method) }
+        return .object(["attached": .bool(true)])
+      }
+    }
+
+    await store.send(.attachmentsPasting) { $0.pendingPasteCount = 1 }
+    await store.send(.attachmentsPasted(PickedBatch(items: [pasted]))) {
+      $0.pendingPasteCount = 0
+      $0.attachments = [pasted.attachment(id: self.uuid(0))]
+    }
+    await store.send(.composerSubmitted) {
+      $0.isSending = true
+      $0.attachments[0].uploadState = .uploading
+    }
+    await store.receive(\.attachmentsSubmitted) {
+      $0.transcript = [ChatRow(
+        id: self.uuid(1),
+        kind: .message(role: .user, text: "look", isComplete: true),
+        attachmentImages: [pasted.data], // the pasted bytes echo back as the thumbnail
+        timestamp: self.t0
+      )]
+      $0.composerText = ""
+      $0.attachments = []
+    }
+    #expect(methods.value == ["image.attach_bytes", "prompt.submit"])
+  }
+
+  /// A cancel carries no items *and* no drops, so it stays silent — the distinction the drop
+  /// count exists to draw.
+  @Test func cancelledPhotoPickerAddsNothing() async {
+    let store = TestStore(initialState: ChatFeature.State(connection: conn)) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing // captured by the effect even though no item needs an id
+      $0.attachmentPicker.pickPhotos = { @Sendable in PickedBatch() }
+    }
+    await store.send(.attachPhotosTapped) // empty selection → no attachmentAdded, no banner
+  }
+
+  // MARK: Attachment upload + submit (#8)
+
+  private func pdfAttachment(_ n: Int) -> ComposerAttachment {
+    ComposerAttachment(
+      id: uuid(n), kind: .pdf, filename: "doc\(n).pdf",
+      mimeType: "application/pdf", data: Data([0x25, 0x50, UInt8(n)])
+    )
+  }
+
+  private func fileAttachment(_ n: Int) -> ComposerAttachment {
+    ComposerAttachment(
+      id: uuid(n), kind: .file, filename: "file\(n).txt",
+      mimeType: "text/plain", data: Data([0x41, UInt8(n)])
+    )
+  }
+
+  /// A submit store that records the outbound RPC method order and the `prompt.submit`
+  /// text. `file.attach` replies with `fileRef`; `fail` makes the first upload throw.
+  private func submitStore(
+    text: String,
+    attachments: [ComposerAttachment],
+    methods: LockIsolated<[String]>,
+    promptText: LockIsolated<String> = .init(""),
+    fileRef: String = "@file:uploads/doc.txt",
+    fail: GatewayError? = nil
+  ) -> TestStore<ChatFeature.State, ChatFeature.Action> {
+    var initial = ChatFeature.State(connection: conn, status: .ready)
+    initial.liveSessionID = "live"
+    initial.composerText = text
+    initial.attachments = attachments
+    return TestStore(initialState: initial) { ChatFeature() } withDependencies: {
+      $0.uuid = .incrementing
+      $0.date = .constant(.init(timeIntervalSince1970: 0))
+      $0.hermesGateway.send = { @Sendable method, params in
+        methods.withValue { $0.append(method) }
+        if method == "prompt.submit" { promptText.setValue(params["text"]?.stringValue ?? "") }
+        if let fail { throw fail }
+        if method == "file.attach" { return .object(["attached": .bool(true), "ref_text": .string(fileRef)]) }
+        return .object(["attached": .bool(true)])
+      }
+    }
+  }
+
+  @Test func imageAttachmentUploadsBytesThenSubmits() async {
+    let methods = LockIsolated<[String]>([])
+    let store = submitStore(text: "look", attachments: [imageAttachment(5)], methods: methods)
+
+    await store.send(.composerSubmitted) {
+      $0.isSending = true
+      $0.attachments[0].uploadState = .uploading
+    }
+    await store.receive(\.attachmentsSubmitted) {
+      $0.transcript = [ChatRow(
+        id: self.uuid(0),
+        kind: .message(role: .user, text: "look", isComplete: true),
+        attachmentImages: [Data([0x89, 0x50, 5])], // image echoed as a thumbnail
+        timestamp: self.t0
+      )]
+      $0.composerText = ""
+      $0.attachments = []
+    }
+    #expect(methods.value == ["image.attach_bytes", "prompt.submit"])
+  }
+
+  @Test func pdfAttachmentUploadsThenSubmits() async {
+    let methods = LockIsolated<[String]>([])
+    let store = submitStore(text: "read", attachments: [pdfAttachment(6)], methods: methods)
+
+    await store.send(.composerSubmitted) {
+      $0.isSending = true
+      $0.attachments[0].uploadState = .uploading
+    }
+    await store.receive(\.attachmentsSubmitted) {
+      $0.transcript = [ChatRow(id: self.uuid(0), kind: .message(role: .user, text: "read", isComplete: true), timestamp: self.t0)]
+      $0.composerText = ""
+      $0.attachments = []
+    }
+    #expect(methods.value == ["pdf.attach", "prompt.submit"])
+  }
+
+  @Test func fileAttachmentWeavesRefIntoPromptText() async {
+    let methods = LockIsolated<[String]>([])
+    let promptText = LockIsolated<String>("")
+    let store = submitStore(
+      text: "summarize", attachments: [fileAttachment(7)],
+      methods: methods, promptText: promptText, fileRef: "@file:uploads/file7.txt"
+    )
+
+    await store.send(.composerSubmitted) {
+      $0.isSending = true
+      $0.attachments[0].uploadState = .uploading
+    }
+    await store.receive(\.attachmentsSubmitted) {
+      $0.transcript = [ChatRow(id: self.uuid(0), kind: .message(role: .user, text: "summarize", isComplete: true), timestamp: self.t0)]
+      $0.composerText = ""
+      $0.attachments = []
+    }
+    #expect(methods.value == ["file.attach", "prompt.submit"])
+    #expect(promptText.value == "@file:uploads/file7.txt\nsummarize") // ref prepended on its own line
+  }
+
+  @Test func mixedAttachmentsUploadEachByKindThenSubmit() async {
+    let methods = LockIsolated<[String]>([])
+    let store = submitStore(
+      text: "", attachments: [imageAttachment(5), pdfAttachment(6), fileAttachment(7)], methods: methods
+    )
+
+    await store.send(.composerSubmitted) {
+      $0.isSending = true
+      $0.attachments[0].uploadState = .uploading
+      $0.attachments[1].uploadState = .uploading
+      $0.attachments[2].uploadState = .uploading
+    }
+    await store.receive(\.attachmentsSubmitted) {
+      // No text → the image shows as a thumbnail; non-image files fall back to their names.
+      $0.transcript = [ChatRow(
+        id: self.uuid(0),
+        kind: .message(role: .user, text: "doc6.pdf, file7.txt", isComplete: true),
+        attachmentImages: [Data([0x89, 0x50, 5])],
+        timestamp: self.t0
+      )]
+      $0.attachments = []
+    }
+    #expect(methods.value == ["image.attach_bytes", "pdf.attach", "file.attach", "prompt.submit"])
+  }
+
+  @Test func uploadFailureAbortsSubmitAndKeepsAttachments() async {
+    let methods = LockIsolated<[String]>([])
+    let store = submitStore(
+      text: "keep me", attachments: [imageAttachment(5)], methods: methods, fail: .server("boom")
+    )
+
+    await store.send(.composerSubmitted) {
+      $0.isSending = true
+      $0.attachments[0].uploadState = .uploading
+    }
+    await store.receive(\.attachmentUploadFailed) {
+      $0.errorBanner = "Attachment failed: boom"
+      $0.isSending = false
+      $0.attachments[0].uploadState = .failed("boom")
+    }
+    // Client-side turn end → the slot-teardown/glow delegate fires (no server event follows).
+    await store.receive(\.delegate.runningChanged)
+    #expect(store.state.composerText == "keep me") // input preserved for retry
+    #expect(store.state.attachments.count == 1)
+    #expect(methods.value == ["image.attach_bytes"]) // never reached prompt.submit
+  }
+
+  // MARK: Capability gating for old agents (#8, -32601)
+
+  @Test func gatewayErrorDetectsUnknownMethod() {
+    #expect(GatewayError.server("unknown method: image.attach_bytes").isUnknownMethod)
+    #expect(GatewayError.server("Unknown method: x").isUnknownMethod) // case-insensitive
+    #expect(!GatewayError.server("boom").isUnknownMethod)
+    #expect(!GatewayError.disconnected.isUnknownMethod)
+    #expect(!GatewayError.timedOut(method: "image.attach_bytes").isUnknownMethod)
+  }
+
+  @Test func unknownAttachMethodGatesFeatureAndAborts() async {
+    let methods = LockIsolated<[String]>([])
+    let store = submitStore(
+      text: "hi", attachments: [imageAttachment(5)], methods: methods,
+      fail: .server("unknown method: image.attach_bytes")
+    )
+
+    await store.send(.composerSubmitted) {
+      $0.isSending = true
+      $0.attachments[0].uploadState = .uploading
+    }
+    await store.receive(\.attachmentsUnsupportedDetected) {
+      $0.attachmentsUnsupported = true
+      $0.isSending = false
+      $0.errorBanner = "This Hermes agent is too old to accept attachments. Update the agent to send files."
+      $0.attachments[0].uploadState = .failed("Attachments not supported")
+    }
+    // Client-side turn end → the slot-teardown/glow delegate fires (no server event follows).
+    await store.receive(\.delegate.runningChanged)
+    #expect(methods.value == ["image.attach_bytes"]) // aborted before prompt.submit
+    #expect(store.state.composerText == "hi") // input preserved
+  }
+
+  // MARK: Push-tap approval recovery (#30 workaround)
+
+  /// A minimal activate response for the recovery tests: no messages/inflight, usage
+  /// present (so `applyActivate` skips the on-demand usage fetch) and the given `running`.
+  private func activateResponse(running: Bool) -> ActivateResponse {
+    ActivateResponse(
+      sessionID: "live123",
+      storedSessionID: "stored123",
+      messages: [],
+      info: SessionInfo(
+        model: "claude-opus-4-8",
+        usage: Usage(contextUsed: 1, contextMax: 200_000, contextPercent: 0)
+      ),
+      running: running
+    )
+  }
+
+  /// A TestStore over a chat whose hydrate is driven by direct `.activateResult` sends —
+  /// the same reduction path (`applyActivate`) all open/foreground/reattach routes funnel
+  /// through. Non-exhaustive: these tests assert the interaction/hint state, not the
+  /// timer/persist bookkeeping already covered by `HydrateTests`.
+  private func recoveryStore(_ initial: ChatFeature.State) -> TestStoreOf<ChatFeature> {
+    let store = TestStore(initialState: initial) {
+      ChatFeature()
+    } withDependencies: {
+      $0.uuid = .incrementing
+      $0.continuousClock = TestClock()
+      $0.date = .constant(Date(timeIntervalSince1970: 0))
+      $0.chatSnapshot = .inMemory()
+      // Only `approval.respond` is sent here (hydrates are driven by direct
+      // `.activateResult` sends); `resolved: 1` is a clean success — no feedback action
+      // fires, the optimistic "Approved"/"Denied" row stands.
+      $0.hermesGateway.send = { @Sendable _, _ in .object(["resolved": .number(1)]) }
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+    return store
+  }
+
+  @Test func hydrateWithHintOnRunningTurnSynthesizesRecoveredCard() async {
+    // The approval push fired while the socket was down; the tap set the hint. Hydrate
+    // reports the turn still running and no real request arrived → the generic
+    // command-less card is synthesized and the one-shot hint is consumed.
+    var initial = ChatFeature.State(connection: conn)
+    initial.expectsPendingApproval = true
+    let store = recoveryStore(initial)
+
+    await store.send(.activateResult(.success(activateResponse(running: true))))
+    #expect(store.state.pendingInteraction == .approval(ChatFeature.recoveredApprovalRequest))
+    #expect(store.state.expectsPendingApproval == false)
+    // The synthetic card is command-less by design (the push carries no content).
+    if case let .approval(request) = store.state.pendingInteraction {
+      #expect(request.command == nil)
+      #expect(request.detail?.isEmpty == false)
+    }
+
+    // Double hydrate of the same running turn: the hint was consumed on the first pass,
+    // so after the user answers the card a re-hydrate must NOT re-synthesize it.
+    await store.send(.respondToApproval(token: store.state.pendingInteractionToken, approve: true, all: false))
+    #expect(store.state.pendingInteraction == nil)
+    await store.send(.activateResult(.success(activateResponse(running: true))))
+    #expect(store.state.pendingInteraction == nil)
+    #expect(store.state.expectsPendingApproval == false)
+
+    await store.send(.teardown)
+  }
+
+  @Test func hydrateWithHintOnStoppedTurnSynthesizesNothing() async {
+    // The approval resolved / timed out / the turn finished while we were detached:
+    // `running == false` → no phantom card, hint still consumed.
+    var initial = ChatFeature.State(connection: conn)
+    initial.expectsPendingApproval = true
+    let store = recoveryStore(initial)
+
+    await store.send(.activateResult(.success(activateResponse(running: false))))
+    #expect(store.state.pendingInteraction == nil)
+    #expect(store.state.expectsPendingApproval == false)
+
+    await store.send(.teardown)
+  }
+
+  @Test func hydrateWithHintLeavesRealInteractionUntouched() async {
+    // The socket already delivered a real blocking request before the hydrate landed —
+    // the hint must not clobber it with the generic card (it is consumed silently).
+    let real = ApprovalRequest(command: "rm -rf /tmp/x", detail: "Removes files", patternKey: "rm")
+    var initial = ChatFeature.State(connection: conn)
+    initial.expectsPendingApproval = true
+    initial.pendingInteraction = .approval(real)
+    let store = recoveryStore(initial)
+
+    await store.send(.activateResult(.success(activateResponse(running: true))))
+    #expect(store.state.pendingInteraction == .approval(real))
+    #expect(store.state.expectsPendingApproval == false)
+
+    await store.send(.teardown)
+  }
+
+  @Test func hydrateWithoutHintSynthesizesNothing() async {
+    // Zero behavior change for sessions never touched by an approval push: a plain
+    // hydrate of a running turn sets no card.
+    let store = recoveryStore(ChatFeature.State(connection: conn))
+
+    await store.send(.activateResult(.success(activateResponse(running: true))))
+    #expect(store.state.pendingInteraction == nil)
+    #expect(store.state.expectsPendingApproval == false)
+
+    await store.send(.teardown)
+  }
+
+  @Test func realApprovalRequestOverwritesSyntheticCardAndClearsHint() async {
+    // hermes-agent #30 composes with this workaround: when the real event does arrive
+    // (e.g. the agent learns to re-surface pending approvals), it overwrites the
+    // synthetic card unconditionally AND clears the hint so a later hydrate of the
+    // still-running turn cannot re-synthesize over the real details.
+    var initial = ChatFeature.State(connection: conn)
+    initial.pendingInteraction = .approval(ChatFeature.recoveredApprovalRequest)
+    initial.expectsPendingApproval = true // a second tap re-armed the hint meanwhile
+    let real = ApprovalRequest(command: "sudo reboot", detail: "Reboots the host", patternKey: "sudo")
+    let store = recoveryStore(initial)
+
+    await store.send(.gatewayEvent(.approvalRequest(real))) {
+      $0.pendingInteraction = .approval(real)
+      $0.expectsPendingApproval = false
+    }
+
+    // A follow-up hydrate of the same running turn: the real card stands (no re-synthesis).
+    await store.send(.activateResult(.success(activateResponse(running: true))))
+    #expect(store.state.pendingInteraction == .approval(real))
+    #expect(store.state.expectsPendingApproval == false)
+
+    await store.send(.teardown)
+  }
+
+  @Test func hydrateOfStoppedTurnClearsStaleApprovalCard() async {
+    // Card synthesized on an earlier hydrate, user backgrounded without answering, the
+    // approval was handled elsewhere and the turn ENDED while the socket was down: the
+    // next hydrate's authoritative `running == false` must drop the stale card (the
+    // server never ends a turn with an approval queued) — never leave a phantom card
+    // locking the composer over a finished transcript.
+    var initial = ChatFeature.State(connection: conn)
+    initial.pendingInteraction = .approval(ChatFeature.recoveredApprovalRequest)
+    let store = recoveryStore(initial)
+
+    await store.send(.activateResult(.success(activateResponse(running: false))))
+    #expect(store.state.pendingInteraction == nil)
+    #expect(store.state.isSending == false)
+
+    await store.send(.teardown)
+  }
+
+  @Test func turnCompleteClearsStaleApprovalCardAndHint() async {
+    // The mainline recovered-card false positive: the approval was answered on another
+    // client, so the turn kept running (card synthesized), then COMPLETED over the live
+    // socket. The turn-end event must drop the card (and any re-armed hint) so the
+    // finished chat isn't stuck behind it.
+    var initial = ChatFeature.State(connection: conn)
+    initial.pendingInteraction = .approval(ChatFeature.recoveredApprovalRequest)
+    initial.expectsPendingApproval = true // a second tap re-armed the hint meanwhile
+    initial.isSending = true
+    initial.liveSessionID = "live123"
+    initial.composerText = "next prompt"
+    let store = recoveryStore(initial)
+    #expect(store.state.canSend == false) // blocked while the (stale) card stands
+
+    await store.send(.gatewayEvent(.messageComplete(text: "done", usage: nil)))
+    await store.skipReceivedActions()
+    #expect(store.state.pendingInteraction == nil)
+    #expect(store.state.expectsPendingApproval == false)
+    #expect(store.state.isSending == false)
+    #expect(store.state.canSend) // composer unblocked
+
+    await store.send(.teardown)
+  }
+
+  @Test func turnErrorClearsStaleApprovalCardAndHint() async {
+    // Same staleness rule when the turn ends in error.
+    var initial = ChatFeature.State(connection: conn)
+    initial.pendingInteraction = .approval(ChatFeature.recoveredApprovalRequest)
+    initial.expectsPendingApproval = true
+    initial.isSending = true
+    let store = recoveryStore(initial)
+
+    await store.send(.gatewayEvent(.error(message: "boom")))
+    #expect(store.state.pendingInteraction == nil)
+    #expect(store.state.expectsPendingApproval == false)
+
+    await store.send(.teardown)
+  }
+
+  @Test func hydrateFailureKeepsHintArmedForTheRetry() async {
+    // A failed hydrate (offline blip) must NOT consume the hint — recovery would die on
+    // the first flaky resume. The follow-up successful hydrate of the still-running turn
+    // consumes it and synthesizes the card.
+    var initial = ChatFeature.State(connection: conn)
+    initial.expectsPendingApproval = true
+    let store = recoveryStore(initial)
+
+    await store.send(.activateResult(.failure(.disconnected)))
+    #expect(store.state.expectsPendingApproval == true)
+
+    await store.send(.activateResult(.success(activateResponse(running: true))))
+    #expect(store.state.pendingInteraction == .approval(ChatFeature.recoveredApprovalRequest))
+    #expect(store.state.expectsPendingApproval == false)
+
+    await store.send(.teardown)
+  }
+
+  // MARK: Unprompted new chat (iPad split view, #80 — the "new session" no-op predicate)
+
+  /// Fresh state is an unprompted new chat; a composer draft, staged attachments, and a
+  /// connected-but-unprompted live session do NOT make it prompted.
+  @Test func isUnpromptedNewChatTrueForFreshChatRegardlessOfDraftOrLiveSession() {
+    var state = ChatFeature.State(connection: conn)
+    #expect(state.isUnpromptedNewChat)
+
+    state.composerText = "typed but never sent"
+    state.attachments = [imageAttachment(0)]
+    #expect(state.isUnpromptedNewChat, "a draft is exactly what the no-op clears")
+
+    state.liveSessionID = "live"
+    state.status = .ready
+    #expect(state.isUnpromptedNewChat, "a live session with no DB row holds nothing worth keeping")
+  }
+
+  @Test func isUnpromptedNewChatFalseWithStoredID() {
+    let state = ChatFeature.State(connection: conn, resumeStoredID: "20260610_abc")
+    #expect(!state.isUnpromptedNewChat)
+  }
+
+  /// The regular-width seat dials the moment it is seated, and `session.create` hands back a
+  /// `stored_session_id` before a single prompt or DB row exists. The predicate must survive
+  /// that handshake — otherwise the seat stops qualifying for the "new session" reset, the
+  /// profile reseat, and the narrowing drop seconds after launch.
+  @Test func isUnpromptedNewChatSurvivesTheSessionCreateHandshake() async {
+    let store = recoveryStore(ChatFeature.State(connection: conn))
+    #expect(store.state.isUnpromptedNewChat)
+
+    await store.send(.sessionResult(.success(
+      SessionHandle(sessionID: "live-1", storedSessionID: "20260610_seat")
+    ))) {
+      $0.liveSessionID = "live-1"
+      $0.storedSessionID = "20260610_seat"
+      $0.status = .ready
+      $0.hasHydrated = true
+    }
+    #expect(store.state.isUnpromptedNewChat)
+    #expect(store.state.isPristineNewChat)
+
+    await store.send(.teardown)
+  }
+
+  /// A branch primed straight from its `session.create` (#34) carries seeded history the
+  /// server holds in memory: never a "new chat", even before its first hydrate paints a row.
+  /// Modern agents return a `stored_session_id` at create (so the chat resumes one); older
+  /// ones don't, which is what the attach/seed clauses cover.
+  @Test func isUnpromptedNewChatFalseForAnUnpersistedBranch() {
+    var state = ChatFeature.State(connection: conn)
+    state.attachLiveSessionID = "live-branch"
+    state.branchSeed = ChatFeature.State.BranchSeed(text: "seed", parentSessionID: "parent")
+    #expect(state.transcript.isEmpty)
+    #expect(!state.isUnpromptedNewChat)
+    #expect(!state.isPristineNewChat)
+  }
+
+  @Test func isUnpromptedNewChatFalseWithTranscriptRow() {
+    var state = ChatFeature.State(connection: conn)
+    state.transcript = [ChatRow(id: uuid(0), kind: .message(role: .user, text: "hi", isComplete: true))]
+    #expect(!state.isUnpromptedNewChat)
+  }
+
+  @Test func isUnpromptedNewChatFalseWhileSending() {
+    var state = ChatFeature.State(connection: conn)
+    state.isSending = true
+    #expect(!state.isUnpromptedNewChat)
+  }
+
+  @Test func isUnpromptedNewChatFalseWithQueuedWork() {
+    var queued = ChatFeature.State(connection: conn)
+    queued.queuedPrompts = [QueuedPrompt(id: uuid(0), text: "later")]
+    #expect(!queued.isUnpromptedNewChat)
+
+    var draining = ChatFeature.State(connection: conn)
+    draining.drainingEntry = QueuedPrompt(id: uuid(1), text: "now")
+    #expect(!draining.isUnpromptedNewChat)
+  }
+
+  // MARK: Pristine new chat (iPad split view, #80 — the narrowing-drop predicate)
+
+  /// The regular-width seat exactly as it was seated: nothing typed, staged, or sent.
+  @Test func isPristineNewChatTrueForFreshChat() {
+    var state = ChatFeature.State(connection: conn)
+    #expect(state.isPristineNewChat)
+
+    // A dialled-but-unprompted socket is still pristine — the live session holds nothing.
+    state.liveSessionID = "live"
+    state.status = .ready
+    #expect(state.isPristineNewChat)
+  }
+
+  /// A typed draft makes the seat worth keeping: narrowing must push its marker, not drop it.
+  @Test func isPristineNewChatFalseWithComposerDraft() {
+    var state = ChatFeature.State(connection: conn)
+    state.composerText = "typed but never sent"
+    #expect(state.isUnpromptedNewChat)
+    #expect(!state.isPristineNewChat)
+  }
+
+  /// Staged attachments alone (no typed text) are equally the user's work — dropping such a
+  /// seat on narrowing would silently discard the picked files.
+  @Test func isPristineNewChatFalseWithStagedAttachmentsOnly() {
+    var state = ChatFeature.State(connection: conn)
+    state.attachments = [imageAttachment(0)]
+    #expect(state.composerText.isEmpty)
+    #expect(state.isUnpromptedNewChat)
+    #expect(!state.isPristineNewChat)
+  }
+
+  /// Every non-unprompted chat is non-pristine too (the predicate is a strict narrowing).
+  @Test func isPristineNewChatFalseForPromptedChat() {
+    let state = ChatFeature.State(connection: conn, resumeStoredID: "20260610_abc")
+    #expect(!state.isPristineNewChat)
+  }
+
+  /// An empty composer is NOT proof the seat is disposable: a paste still loading or a live
+  /// mic will fill it in a moment, and neither survives the narrowing teardown. Both must
+  /// read non-pristine so the seat keeps its marker instead.
+  @Test func isPristineNewChatFalseWithInFlightComposerInput() {
+    var pasting = ChatFeature.State(connection: conn)
+    pasting.pendingPasteCount = 1
+    #expect(pasting.composerText.isEmpty && pasting.attachments.isEmpty)
+    #expect(!pasting.isDiscardableNewChat)
+    #expect(!pasting.isPristineNewChat)
+
+    var recording = ChatFeature.State(connection: conn)
+    recording.recording = .recording
+    #expect(!recording.isDiscardableNewChat)
+    #expect(!recording.isPristineNewChat)
+  }
+
+  /// The shared seat predicate: unprompted AND nothing still resolving. A plain draft is
+  /// discardable (the "New session" reset clears it deliberately); a prompted chat is not.
+  @Test func isDiscardableNewChatCoversUnpromptedSeatsWithNothingInFlight() {
+    var draft = ChatFeature.State(connection: conn)
+    draft.composerText = "typed"
+    #expect(draft.isDiscardableNewChat)
+
+    let resumed = ChatFeature.State(connection: conn, resumeStoredID: "20260610_abc")
+    #expect(!resumed.isDiscardableNewChat)
+  }
+
+  // MARK: In-flight composer input (#80 — what a draft reset cannot reach)
+
+  /// A pending paste and every busy voice phase count; a plain draft does not. These are the
+  /// states where clearing `composerText`/`attachments` is not a reset — the batch or the
+  /// transcription lands afterwards, in the supposedly fresh composer.
+  @Test func hasInFlightComposerInputCoversPendingPasteAndVoice() {
+    var draft = ChatFeature.State(connection: conn)
+    draft.composerText = "typed"
+    draft.attachments = [imageAttachment(0)]
+    #expect(!draft.hasInFlightComposerInput)
+
+    var pasting = ChatFeature.State(connection: conn)
+    pasting.pendingPasteCount = 1
+    #expect(pasting.hasInFlightComposerInput)
+
+    for phase in [ChatFeature.State.RecordingState.requestingPermission, .recording, .transcribing] {
+      var voice = ChatFeature.State(connection: conn)
+      voice.recording = phase
+      #expect(voice.hasInFlightComposerInput, "\(phase) is composer input still resolving")
+    }
+  }
+
+  // MARK: Empty-chat hero (iPad split view, #80 — `showsEmptyHero` truth table)
+
+  /// A brand-new chat has nothing to wait for: the hero shows at once, before any
+  /// handshake, and a composer draft does not hide it.
+  @Test func showsEmptyHeroTrueForFreshNewChat() {
+    var state = ChatFeature.State(connection: conn)
+    #expect(!state.hasHydrated)
+    #expect(state.showsEmptyHero)
+
+    state.composerText = "typed but never sent"
+    state.attachments = [imageAttachment(0)]
+    #expect(state.showsEmptyHero, "a draft lives in the composer, not the transcript region")
+  }
+
+  /// A RESUMED session with no snapshot cache has an empty transcript for the round-trip
+  /// before history lands — the hero must not flash there.
+  @Test func showsEmptyHeroFalseForResumedSessionBeforeHydrate() {
+    let state = ChatFeature.State(connection: conn, resumeStoredID: "20260610_abc")
+    #expect(state.transcript.isEmpty)
+    #expect(!state.hasHydrated)
+    #expect(!state.showsEmptyHero)
+  }
+
+  /// Once the hydrate has landed, a genuinely empty server history shows the hero.
+  @Test func showsEmptyHeroTrueForResumedSessionAfterHydrateWithEmptyHistory() {
+    var state = ChatFeature.State(connection: conn, resumeStoredID: "20260610_abc")
+    state.hasHydrated = true
+    #expect(state.showsEmptyHero)
+  }
+
+  @Test func showsEmptyHeroFalseWithAnyTranscriptRow() {
+    var fresh = ChatFeature.State(connection: conn)
+    fresh.transcript = [ChatRow(id: uuid(0), kind: .message(role: .user, text: "hi", isComplete: true))]
+    #expect(!fresh.showsEmptyHero)
+
+    var hydrated = ChatFeature.State(connection: conn, resumeStoredID: "20260610_abc")
+    hydrated.hasHydrated = true
+    hydrated.transcript = [
+      ChatRow(id: uuid(1), kind: .reasoning(text: "hmm"))
+    ]
+    #expect(!hydrated.showsEmptyHero, "a live reasoning row is transcript content too")
+  }
+
+  @Test func showsEmptyHeroFalseWhileSending() {
+    var state = ChatFeature.State(connection: conn)
+    state.isSending = true
+    #expect(!state.showsEmptyHero)
+  }
+
+  @Test func showsEmptyHeroFalseWithStreamingRow() {
+    var state = ChatFeature.State(connection: conn)
+    state.streamingRowID = uuid(0)
+    #expect(!state.showsEmptyHero)
+  }
+
+  /// Reducer path: the resumed chat hides the hero until `activateResult(.success)` with
+  /// an empty history lands (`applyActivate` flips `hasHydrated`); the hero then shows;
+  /// the next turn's `message.start` + first delta hide it again (`isSending`, then the
+  /// lazily created streaming row).
+  @Test func hydrateWithEmptyHistoryShowsHeroAndADeltaHidesIt() async {
+    let initial = ChatFeature.State(connection: conn, resumeStoredID: "stored123")
+    let store = recoveryStore(initial)
+    #expect(!store.state.showsEmptyHero)
+
+    await store.send(.activateResult(.success(activateResponse(running: false)))) {
+      $0.hasHydrated = true
+    }
+    #expect(store.state.transcript.isEmpty)
+    #expect(store.state.showsEmptyHero)
+
+    await store.send(.gatewayEvent(.messageStart))
+    #expect(store.state.isSending)
+    #expect(!store.state.showsEmptyHero)
+
+    await store.send(.gatewayEvent(.messageDelta(text: "Hel")))
+    #expect(store.state.streamingRowID != nil)
+    #expect(!store.state.transcript.isEmpty)
+    #expect(!store.state.showsEmptyHero)
+
+    await store.send(.teardown)
+  }
+
+  /// A hydrate reporting a STILL-RUNNING turn with empty history hides the hero through
+  /// `isSending` even though the transcript is empty (the live turn adds no row — nothing
+  /// to hero over).
+  @Test func hydrateOfRunningTurnWithEmptyHistoryHidesHero() async {
+    let store = recoveryStore(ChatFeature.State(connection: conn, resumeStoredID: "stored123"))
+
+    await store.send(.activateResult(.success(activateResponse(running: true))))
+    #expect(store.state.hasHydrated)
+    #expect(store.state.isSending)
+    #expect(!store.state.showsEmptyHero)
+
+    await store.send(.teardown)
+  }
+
+  /// The fresh-session `session.create` handle is that chat's hydrate: a handle carrying
+  /// a `stored_session_id` must not flip the hero off for a chat the server just created
+  /// empty.
+  @Test func createHandshakeMarksHydratedSoStoredIDKeepsHero() async {
+    let store = recoveryStore(ChatFeature.State(connection: conn))
+    #expect(store.state.showsEmptyHero)
+
+    await store.send(.sessionResult(.success(
+      SessionHandle(sessionID: "live456", storedSessionID: "20260610_fresh")
+    ))) {
+      $0.liveSessionID = "live456"
+      $0.storedSessionID = "20260610_fresh"
+      $0.status = .ready
+      $0.hasHydrated = true
+    }
+    #expect(store.state.showsEmptyHero)
+
+    await store.send(.teardown)
+  }
+}

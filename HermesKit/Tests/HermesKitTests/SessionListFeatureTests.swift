@@ -1,0 +1,6167 @@
+import ComposableArchitecture
+import Foundation
+import Testing
+
+@testable import HermesKit
+
+// Keep real-transport reducer coverage under the shared serialized stub owner.
+extension RESTTransportSuite {
+  @MainActor
+  struct SessionListSearchPinTransportTests {
+    @Test(arguments: 0..<4, ["default", "work"])
+    func decodedNilSearchPinsWriteAfterServerCapability(scenario: Int, profile: String) async throws {
+      let pinned = scenario & 1 != 0
+      let nullField = scenario & 2 != 0
+      let connection = ServerConnection(baseURL: URL(string: "http://test.local:9119")!, token: "tok")
+      let config = URLSessionConfiguration.ephemeral
+      config.protocolClasses = [MockURLProtocol.self]
+      let rest = HermesRESTClient.live(session: URLSession(configuration: config))
+      let json = nullField
+        ? #"{"results":[{"session_id":"a","pinned":null}]}"#
+        : #"{"results":[{"session_id":"a"}]}"#
+      // search, the pin write's mutation-snapshot read, the fenced PATCH, the refetch.
+      let snapshot = #"{"session_id":"a","exists":true,"runtime_revision":3,"runtime_generation":1}"#
+      MockURLProtocol.setSequence([
+        .init(body: Data(json.utf8)), .init(body: Data(snapshot.utf8)), .init(),
+        .init(body: Data(json.utf8)),
+      ])
+      let rows = try await rest.search(connection, "find", profile)
+      let row = try #require(rows.first)
+      #expect(row.pinned == nil)
+      let original = pinned ? ["keep"] : ["keep", "a"]
+      let expected = pinned ? ["keep", "a"] : ["keep"]
+      let prefs = PreferencesClient.inMemory()
+      prefs.savePinnedIDs(original)
+      prefs.saveSeenCounts(["a": 0])
+      let initial = SessionListFeature.State(
+        connection: connection, sessions: [row], searchQuery: "find",
+        seenCounts: ["a": 0], pinnedIDs: original,
+        selectedProfileName: profile, profilesSupported: true, cronJobsSupported: false
+      )
+      // A checkpoint proves that this server previously returned a capable list.
+      prefs.savePinMigration(initial.pinMigrationServerID, PinMigration(pendingIDs: []))
+      let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+        $0.preferences = prefs
+        $0.date = .constant(initial.now)
+        $0.hermesREST = rest
+      }
+      await store.send(pinned ? .pinSession(id: "a") : .unpinSession(id: "a")) {
+        $0.pinnedIDs = expected
+        $0.pinMutations["a"] = .init(
+          pinned: pinned, previousIndex: pinned ? nil : 1,
+          profileName: profile
+        )
+      }
+      await store.receive(\.pinWriteFinished) {
+        $0.pinMutations = [:]
+        $0.isLoading = true
+      }
+      await store.receive(\.sessionsResponse.success) { $0.isLoading = false }
+      await store.finish()
+      #expect(prefs.loadPinnedIDs() == expected)
+      #expect(MockURLProtocol.requests.count == 4)
+      let patches = MockURLProtocol.requests.filter { $0.httpMethod == "PATCH" }
+      #expect(patches.count == 1)
+      let request = try #require(patches.first)
+      #expect(request.url?.path == "/api/sessions/a")
+      let body = try #require(JSONSerialization.jsonObject(with: mockRequestBody(request)) as? [String: Any])
+      #expect(body["pinned"] as? Bool == pinned)
+      #expect(body["profile"] as? String == profile)
+      #expect(body["expected_revision"] as? Int == 3)
+    }
+  }
+}
+
+@MainActor
+struct SessionListFeatureTests {
+  private let connection = ServerConnection(baseURL: URL(string: "http://mac.tailnet:9119")!, token: "tok")
+
+  private let now = Date(timeIntervalSince1970: 1_749_600_000)
+
+  @Test func knownServerCapabilityPinsSearchRowWithoutPinField() async {
+    let prefs = PreferencesClient.inMemory()
+    let writes = LockIsolated<[String]>([])
+    let initial = SessionListFeature.State(connection: connection, sessions: [Session(id: "hit")], searchQuery: "find", profilesSupported: true, cronJobsSupported: false)
+    prefs.savePinMigration(initial.pinMigrationServerID, PinMigration(pendingIDs: []))
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(now)
+      $0.hermesREST.setPinned = { _, id, _, _ in writes.withValue { $0.append(id) } }
+      $0.hermesREST.search = { _, _, _ in [Session(id: "hit")] }
+    }
+    await store.send(.pinSession(id: "hit")) {
+      $0.pinnedIDs = ["hit"]
+      $0.pinMutations["hit"] = .init(pinned: true, previousIndex: nil, profileName: "default")
+    }
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations = [:]
+      $0.isLoading = true
+      $0.now = now
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.seenCounts = ["hit": 0]
+    }
+    await store.finish()
+    #expect(writes.value == ["hit"])
+    #expect(store.state.pinnedIDs == ["hit"])
+  }
+
+  @Test(arguments: ["archive", "delete", "sheet"])
+  func removalDoesNotExcludePinChanges(operation: String) async {
+    let prefs = PreferencesClient.inMemory()
+    var initial = SessionListFeature.State(connection: connection, sessions: [Session(id: "a")])
+    if operation == "archive" { initial.archivingIDs = ["a"] }
+    if operation == "delete" { initial.deletingIDs = ["a"] }
+    if operation == "sheet" {
+      initial.archived = ArchivedSessionsFeature.State(connection: connection)
+      initial.archived?.deletingIDs = ["a"]
+    }
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+    }
+    #expect(store.state.canChangePin(id: "a"))
+    await store.send(.pinSession(id: "a")) { $0.pinnedIDs = ["a"] }
+    await store.finish()
+    #expect(prefs.loadPinnedIDs() == ["a"])
+  }
+
+  @Test func localFallbackPinMigratesOnFirstCapableList() async {
+    let prefs = PreferencesClient.inMemory()
+    let clock = TestClock()
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a")],
+      selectedProfileName: "work", profilesSupported: true
+    )) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, id, pinned, profile in
+        #expect(id == "a" && pinned && profile == "work")
+        try await clock.sleep(for: .seconds(1))
+      }
+    }
+    await store.send(.pinSession(id: "a")) { $0.pinnedIDs = ["a"] }
+    #expect(prefs.loadPinMigration(store.state.pinMigrationServerID) == nil)
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: false)]))) {
+      $0.sessions = [Session(id: "a", pinned: false)]
+      $0.seenCounts = ["a": 0]
+      $0.pinMutations["a"] = .init(pinned: true, previousIndex: 0, profileName: "work")
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(prefs.loadPinMigration(store.state.pinMigrationServerID)?.pendingIDs == ["a"])
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.pinMigrationFinished) { $0.pinMutations = [:] }
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: false)]))) { $0.pinnedIDs = [] }
+    await store.finish()
+    #expect(prefs.loadPinMigration(store.state.pinMigrationServerID)?.pendingIDs == [])
+  }
+
+  @Test(arguments: [true, false])
+  func pendingArchivedDeleteDoesNotGuardPinChanges(fails: Bool) async {
+    let clock = TestClock()
+    let row = Session(id: "a", pinned: false)
+    var initial = SessionListFeature.State(connection: connection, sessions: [row], profilesSupported: true)
+    initial.archived = ArchivedSessionsFeature.State(connection: connection, sessions: [row])
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.hermesREST.deleteSession = { _, _, _ in
+        try await clock.sleep(for: .seconds(1))
+        if fails { throw RESTError.unreachable }
+      }
+    }
+    await store.send(.archived(.presented(.deleteButtonTapped(id: "a")))) {
+      $0.archived?.sessions = []
+      $0.archived?.deletingIDs = ["a"]
+    }
+    await store.receive(\.archived.presented.delegate.deleted)
+    await store.receive(\.delegate.sessionDeleted)
+    #expect(store.state.canChangePin(id: "a"))
+    await store.send(.archived(.dismiss)) { $0.archived = nil }
+    #expect(store.state.canChangePin(id: "a"))
+    await clock.advance(by: .seconds(1))
+    if fails {
+      await store.receive(\.archivedDeleteFailed) {
+        $0.loadError = "Couldn’t delete the session."
+      }
+    } else {
+      await store.receive(\.archivedDeleteSucceeded)
+      await store.receive(\.delegate.sessionDeleteSucceeded)
+    }
+    #expect(store.state.canChangePin(id: "a"))
+    await store.finish()
+  }
+
+  @Test func pinMigrationUploadsLocalPinsBeforeAcceptingServerFalse() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["b", "a", "absent", "legacy"])
+    let writes = LockIsolated<[String]>([])
+    let clock = TestClock()
+    let initial = SessionListFeature.State(
+      connection: connection, pinnedIDs: prefs.loadPinnedIDs(),
+      selectedProfileName: "work", profilesSupported: true
+    )
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable received, id, pinned, profile in
+        #expect(received == connection)
+        #expect(pinned && profile == "work")
+        try await clock.sleep(for: .seconds(id == "a" ? 1 : 2))
+        writes.withValue { $0.append(id) }
+      }
+    }
+
+    await store.send(.sessionsResponse(.success([
+        Session(id: "a", pinned: false), Session(id: "b", pinned: false),
+        Session(id: "legacy"), Session(id: "desktop", pinned: true)
+      ]))) {
+      $0.sessions = [Session(id: "a", pinned: false), Session(id: "b", pinned: false), Session(id: "legacy"), Session(id: "desktop", pinned: true)]
+      $0.seenCounts = ["a": 0, "b": 0, "legacy": 0, "desktop": 0]
+      $0.pinnedIDs = ["b", "a", "absent", "legacy", "desktop"]
+      $0.pinMutations["a"] = .init(
+        pinned: true, previousIndex: 1, profileName: "work"
+      )
+      $0.pinMutations["b"] = .init(
+        pinned: true, previousIndex: 0, profileName: "work"
+      )
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(store.state.pinnedIDs == ["b", "a", "absent", "legacy", "desktop"])
+    #expect(prefs.loadPinnedIDs() == ["b", "a", "absent", "legacy", "desktop"])
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.pinMigrationFinished) { $0.pinMutations["a"] = nil }
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.pinMigrationFinished) { $0.pinMutations["b"] = nil }
+    await store.finish()
+    #expect(Set(writes.value) == ["a", "b"])
+    #expect(store.state.pinnedIDs == ["b", "a", "absent", "legacy", "desktop"])
+  }
+
+  @Test func migrationRetriesFailedPatchOnNextCapableList() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["a"])
+    let clock = TestClock()
+    let writes = LockIsolated(0)
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, pinnedIDs: ["a"], profilesSupported: true
+    )) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in
+        let attempt = writes.withValue { $0 += 1; return $0 }
+        try await clock.sleep(for: .seconds(1))
+        if attempt == 1 { throw RESTError.unreachable }
+      }
+    }
+    for _ in 1...2 {
+      await store.send(.sessionsResponse(.success([Session(id: "a", pinned: false)]))) {
+        $0.sessions = [Session(id: "a", pinned: false)]
+        $0.seenCounts = ["a": 0]
+        $0.pinMutations["a"] = .init(pinned: true, previousIndex: 0, profileName: "default")
+        if !$0.isSearching { $0.statusSessions = $0.sessions }
+      }
+      #expect(prefs.loadPinMigration(store.state.pinMigrationServerID)?.pendingIDs == ["a"])
+      await clock.advance(by: .seconds(1))
+      await store.receive(\.pinMigrationFinished) { $0.pinMutations = [:] }
+    }
+    await store.finish()
+    #expect(writes.value == 2)
+    #expect(prefs.loadPinMigration(store.state.pinMigrationServerID)?.pendingIDs == [])
+  }
+
+  /// A legacy pin unpinned locally while server writes were off (a failed profiles probe)
+  /// stays pending but is never pushed back as pinned (`setPinned` is unimplemented here).
+  @Test func migrationSkipsPendingIDNoLongerPinnedLocally() async {
+    let prefs = PreferencesClient.inMemory()
+    let initial = SessionListFeature.State(
+      connection: connection, pinnedIDs: [], profilesSupported: true
+    )
+    prefs.savePinMigration(initial.pinMigrationServerID, PinMigration(pendingIDs: ["a"]))
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+    }
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: false)]))) {
+      $0.sessions = [Session(id: "a", pinned: false)]
+      $0.seenCounts = ["a": 0]
+      $0.statusSessions = $0.sessions
+    }
+    await store.finish()
+    #expect(prefs.loadPinnedIDs() == [])
+  }
+
+  @Test func pinMigrationFailureRemainsPendingAndRetriesAfterRelaunch() async {
+    let suite = "pin-migration-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let prefs = PreferencesClient.live(defaults: defaults)
+    prefs.savePinnedIDs(["a", "off-page"])
+    let clock = TestClock()
+    let writes = LockIsolated(0)
+    func launch(fails: Bool) -> TestStoreOf<SessionListFeature> {
+      TestStore(initialState: SessionListFeature.State(
+        connection: connection, seenCounts: prefs.loadSeenCounts(), pinnedIDs: prefs.loadPinnedIDs(),
+        selectedProfileName: "work", profilesSupported: true
+      )) { SessionListFeature() } withDependencies: {
+        $0.preferences = .live(defaults: UserDefaults(suiteName: suite)!)
+        $0.hermesREST.setPinned = { @Sendable _, id, pinned, profile in
+          #expect(id == "a" && pinned && profile == "work")
+          writes.withValue { $0 += 1 }
+          try await clock.sleep(for: .seconds(1))
+          if fails { throw RESTError.unreachable }
+        }
+      }
+    }
+    let first = launch(fails: true)
+    let server = first.state.pinMigrationServerID
+    await first.send(.sessionsResponse(.success([Session(id: "a", pinned: false)]))) {
+      $0.sessions = [Session(id: "a", pinned: false)]
+      $0.seenCounts = ["a": 0]
+      $0.pinMutations["a"] = .init(pinned: true, previousIndex: 0, profileName: "work")
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(prefs.loadPinMigration(server)?.pendingIDs == ["a", "off-page"])
+    await first.send(.sessionsResponse(.success([Session(id: "a", pinned: false)])))
+    await clock.advance(by: .seconds(1))
+    await first.receive(\.pinMigrationFinished) { $0.pinMutations = [:] }
+    await first.finish()
+    #expect(writes.value == 1)
+    #expect(first.state.loadError == nil)
+    #expect(prefs.loadPinMigration(server)?.pendingIDs == ["a", "off-page"])
+    let second = launch(fails: false)
+    await second.send(.sessionsResponse(.success([Session(id: "a", pinned: false)]))) {
+      $0.sessions = [Session(id: "a", pinned: false)]
+      $0.pinMutations["a"] = .init(pinned: true, previousIndex: 0, profileName: "work")
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(prefs.loadPinMigration(server)?.pendingIDs == ["a", "off-page"])
+    await clock.advance(by: .seconds(1))
+    await second.receive(\.pinMigrationFinished) { $0.pinMutations = [:] }
+    await second.finish()
+    #expect(writes.value == 2)
+    #expect(prefs.loadPinMigration(server)?.pendingIDs == ["off-page"])
+    #expect(prefs.loadPinnedIDs() == ["a", "off-page"])
+  }
+
+  @Test func pinMigrationPreservesRemovalRollbackAndRetriesPendingIntent() async {
+    let prefs = PreferencesClient.inMemory()
+    let migration = PinMigration(pendingIDs: ["a"])
+    var state = SessionListFeature.State(connection: connection, profilesSupported: true)
+
+    state.pinMutations["a"] = .init(
+      pinned: false, previousIndex: 0, profileName: "default"
+    )
+    prefs.savePinMigration(state.pinMigrationServerID, migration)
+    let writes = LockIsolated(0)
+    let store = TestStore(initialState: state) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in
+        writes.withValue { $0 += 1 }
+      }
+    }
+
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: false)]))) {
+      $0.sessions = [Session(id: "a", pinned: false)]
+      $0.seenCounts = ["a": 0]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(prefs.loadPinMigration(state.pinMigrationServerID) == migration)
+    #expect(writes.value == 0)
+    await store.send(.pinWriteFinished(
+      id: "a", profileName: "default", error: .unreachable
+    )) {
+      $0.pinMutations = [:]
+      $0.pinnedIDs = ["a"]
+      $0.loadError = RESTError.unreachable.message
+    }
+    #expect(store.state.pinnedIDs == ["a"])
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: false)]))) {
+      $0.pinMutations["a"] = .init(pinned: true, previousIndex: 0, profileName: "default")
+    }
+    await store.receive(\.pinMigrationFinished) { $0.pinMutations = [:] }
+    await store.finish()
+    #expect(writes.value == 1)
+    #expect(prefs.loadPinnedIDs() == ["a"])
+    #expect(prefs.loadPinMigration(state.pinMigrationServerID)?.pendingIDs == [])
+  }
+
+  @Test func offPageMigrationAcceptsServerTrueThenDesktopUnpinWithoutWriting() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["off-page"])
+    let initial = SessionListFeature.State(
+      connection: connection, pinnedIDs: ["off-page"], profilesSupported: true
+    )
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in Issue.record("Unexpected migration PATCH") }
+    }
+    let page = (0..<50).map { Session(id: "row-\($0)", pinned: false) }
+    await store.send(.sessionsResponse(.success(page))) {
+      $0.sessions = IdentifiedArray(uniqueElements: page)
+      $0.seenCounts = Dictionary(uniqueKeysWithValues: page.map { ($0.id, 0) })
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(prefs.loadPinMigration(initial.pinMigrationServerID)?.pendingIDs == ["off-page"])
+    await store.send(.sessionsResponse(.success([Session(id: "off-page", pinned: true)]))) {
+      $0.sessions = [Session(id: "off-page", pinned: true)]
+      $0.seenCounts["off-page"] = 0
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(prefs.loadPinMigration(initial.pinMigrationServerID)?.pendingIDs == [])
+    await store.send(.sessionsResponse(.success([Session(id: "off-page", pinned: false)]))) {
+      $0.sessions = [Session(id: "off-page", pinned: false)]
+      $0.pinnedIDs = []
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.send(.sessionsResponse(.success([Session(id: "off-page", pinned: false)])))
+    await store.finish()
+    #expect(prefs.loadPinnedIDs().isEmpty)
+  }
+
+  @Test(arguments: [false, true])
+  func offPageFirstFalseMigratesLegacyPin(relaunch: Bool) async {
+    let suite = "off-page-migration-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let prefs = PreferencesClient.live(defaults: defaults)
+    prefs.savePinnedIDs(["later", "other-profile", "nil-row"])
+    let writes = LockIsolated<[String]>([])
+    func launch() -> TestStoreOf<SessionListFeature> {
+      TestStore(initialState: SessionListFeature.State(
+        connection: connection, seenCounts: prefs.loadSeenCounts(),
+        pinnedIDs: prefs.loadPinnedIDs(), selectedProfileName: "work", profilesSupported: true
+      )) { SessionListFeature() } withDependencies: {
+        $0.preferences = .live(defaults: UserDefaults(suiteName: suite)!)
+        $0.hermesREST.setPinned = { @Sendable _, id, pinned, profile in
+          #expect(pinned && profile == "work")
+          writes.withValue { $0.append(id) }
+        }
+      }
+    }
+    let first = launch()
+    await first.send(.sessionsResponse(.success([Session(id: "first", pinned: false)]))) {
+      $0.sessions = [Session(id: "first", pinned: false)]
+      $0.seenCounts = ["first": 0]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await first.finish()
+    let server = first.state.pinMigrationServerID
+    #expect(prefs.loadPinMigration(server)?.pendingIDs == ["later", "other-profile", "nil-row"])
+    let store = relaunch ? launch() : first
+    await store.send(.sessionsResponse(.success([Session(id: "later", pinned: false), Session(id: "nil-row")]))) {
+      $0.sessions = [Session(id: "later", pinned: false), Session(id: "nil-row")]
+      $0.seenCounts["later"] = 0
+      $0.seenCounts["nil-row"] = 0
+      $0.pinMutations["later"] = .init(
+        pinned: true, previousIndex: 0, profileName: "work"
+      )
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.receive(\.pinMigrationFinished) { $0.pinMutations = [:] }
+    await store.finish()
+    #expect(writes.value == ["later"])
+    #expect(prefs.loadPinnedIDs() == ["later", "other-profile", "nil-row"])
+    #expect(prefs.loadPinMigration(server)?.pendingIDs == ["other-profile", "nil-row"])
+    await store.send(.sessionsResponse(.success([Session(id: "later", pinned: false)]))) {
+      $0.sessions = [Session(id: "later", pinned: false)]
+      $0.pinnedIDs = ["other-profile", "nil-row"]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.finish()
+    #expect(writes.value == ["later"])
+  }
+
+  @Test func pendingMigrationFollowsIDsAcrossProfiles() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["work-pin", "default-pin", "off-page"])
+    let writes = LockIsolated<[String]>([])
+    let clock = TestClock()
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, pinnedIDs: prefs.loadPinnedIDs(),
+      selectedProfileName: "work", profilesSupported: true, cronJobsSupported: false
+    )) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(Date(timeIntervalSince1970: 0))
+      $0.hermesProfiles.sessions = { @Sendable _, profile, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        #expect(profile == "default")
+        return [Session(id: "default-pin", pinned: false)]
+      }
+      $0.hermesREST.setPinned = { @Sendable _, id, pinned, profile in
+        #expect(pinned)
+        writes.withValue { $0.append("\(profile ?? "nil"):\(id)") }
+        try await clock.sleep(for: .seconds(1))
+      }
+    }
+    await store.send(.sessionsResponse(.success([Session(id: "work-pin", pinned: true)]))) {
+      $0.sessions = [Session(id: "work-pin", pinned: true)]
+      $0.seenCounts = ["work-pin": 0]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(prefs.loadPinMigration(store.state.pinMigrationServerID)?.pendingIDs == ["default-pin", "off-page"])
+    await store.send(.selectProfile(name: "default")) {
+      $0.selectedProfileName = "default"
+      $0.sessions = []
+      $0.isLoading = true
+      $0.statusSessions = nil
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "default-pin", pinned: false)]
+      $0.seenCounts["default-pin"] = 0
+      $0.pinMutations["default-pin"] = .init(pinned: true, previousIndex: 1, profileName: "default")
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(prefs.loadPinMigration(store.state.pinMigrationServerID)?.pendingIDs == ["default-pin", "off-page"])
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.pinMigrationFinished) { $0.pinMutations = [:] }
+    await store.finish()
+    #expect(writes.value == ["default:default-pin"])
+    #expect(prefs.loadPinnedIDs() == ["work-pin", "default-pin", "off-page"])
+    #expect(prefs.loadPinMigration(store.state.pinMigrationServerID)?.pendingIDs == ["off-page"])
+  }
+
+  @Test func pinMigrationProfileSwitchPreservesRows() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["a"])
+    let clock = TestClock()
+    let writes = LockIsolated(0)
+    let state = SessionListFeature.State(
+      connection: connection, pinnedIDs: ["a"], profilesSupported: true, cronJobsSupported: false
+    )
+    let store = TestStore(initialState: state) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(now)
+      $0.hermesREST.setPinned = { @Sendable _, id, pinned, profile in
+        #expect(id == "a" && pinned && profile == "default")
+        writes.withValue { $0 += 1 }
+        try await clock.sleep(for: .seconds(1))
+      }
+      $0.hermesProfiles.sessions = { @Sendable _, profile, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        #expect(profile == "work")
+        return [Session(id: "work-row", pinned: true)]
+      }
+    }
+
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: false)]))) {
+      $0.sessions = [Session(id: "a", pinned: false)]
+      $0.seenCounts = ["a": 0]
+      $0.pinMutations["a"] = .init(
+        pinned: true, previousIndex: 0, profileName: "default"
+      )
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: false)])))
+    #expect(store.state.pinnedIDs == ["a"])
+    await store.send(.selectProfile(name: "work")) {
+      $0.selectedProfileName = "work"
+      $0.sessions = []
+      $0.now = now
+      $0.isLoading = true
+      $0.statusSessions = nil
+    }
+    // The old rows are cleared before the replacement scoped response arrives.
+    #expect(store.state.sessions.isEmpty)
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "work-row", pinned: true)]
+      $0.seenCounts["work-row"] = 0
+      $0.pinnedIDs = ["a", "work-row"]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(store.state.pinnedIDs == ["a", "work-row"])
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.pinMigrationFinished) { $0.pinMutations = [:] }
+    #expect(writes.value == 1) // repeated list while pending cannot duplicate the PATCH
+    #expect(store.state.sessions.ids.elements == ["work-row"])
+    #expect(store.state.pinnedIDs == ["a", "work-row"])
+    #expect(prefs.loadPinnedIDs() == ["a", "work-row"])
+    await store.finish()
+  }
+
+  @Test(arguments: ["nil-field", "nil-search", "search", "unscoped"])
+  func pinMigrationRequiresCurrentExplicitProfileRows(source: String) async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["a"])
+    let state = SessionListFeature.State(
+      connection: connection, searchQuery: source == "search" || source == "nil-search" ? "find" : "",
+      pinnedIDs: ["a"], profilesSupported: source != "unscoped"
+    )
+    let store = TestStore(initialState: state) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in Issue.record("Unexpected migration PATCH") }
+    }
+
+    let rows = [Session(id: "a", pinned: source == "nil-field" || source == "nil-search" ? nil : false)]
+    await store.send(.sessionsResponse(.success(rows))) {
+      $0.sessions = IdentifiedArray(uniqueElements: rows)
+      $0.seenCounts = ["a": 0]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.finish()
+    #expect(store.state.pinnedIDs == ["a"])
+    #expect(prefs.loadPinnedIDs() == ["a"])
+    #expect(prefs.loadPinMigration(state.pinMigrationServerID) == nil)
+  }
+
+  @Test(arguments: ["server", "profile", "missing-checkpoint", "retired-id", "no-mutation"])
+  func pinMigrationCompletionCannotAffectAnotherContext(mismatch: String) async {
+    let prefs = PreferencesClient.inMemory()
+    let migration = PinMigration(pendingIDs: mismatch == "retired-id" ? [] : ["a"])
+    var state = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "new-row")], pinnedIDs: ["newer"],
+      selectedProfileName: "work", profilesSupported: true
+    )
+    if mismatch != "no-mutation" {
+      state.pinMutations["a"] = .init(
+        pinned: true, previousIndex: 0, profileName: "default"
+      )
+    }
+    prefs.savePinnedIDs(state.pinnedIDs)
+    if mismatch != "missing-checkpoint" {
+      prefs.savePinMigration(state.pinMigrationServerID, migration)
+    }
+    let store = TestStore(initialState: state) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+    }
+    await store.send(.pinMigrationFinished(
+      server: mismatch == "server" ? "https://other.example" : state.pinMigrationServerID,
+      id: "a", profileName: mismatch == "profile" ? "other" : "default", error: nil
+    ))
+    await store.finish()
+    #expect(prefs.loadPinnedIDs() == ["newer"])
+    #expect(prefs.loadPinMigration(state.pinMigrationServerID) == (mismatch == "missing-checkpoint" ? nil : migration))
+  }
+
+  @Test func loadSuccess() async {
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      // Old agent (no /api/profiles) → falls back to the unscoped session fetch.
+      $0.hermesProfiles.list = { @Sendable _ in throw RESTError.notFound }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown } // can't tell → don't nag
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in
+        [Session(id: "s1", title: "Hello", preview: "hi")]
+      }
+    }
+
+    await store.send(.task) {
+      $0.now = now
+      $0.isLoading = true
+    }
+    await store.receive(\.setupPush) // probes the plugin hub
+    await store.receive(\.pushPluginStatusLoaded) // unknown → no further effects
+    await store.receive(\.profilesResponse.failure) // capability probe → not supported
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "s1", title: "Hello", preview: "hi")]
+      // The first unfiltered fetch opens the widgets' gate (`agentStatus` stops being nil).
+      $0.statusSessions = [Session(id: "s1", title: "Hello", preview: "hi")]
+      $0.seenCounts = ["s1": 0] // seeded so the session isn't shown unread on first sight
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    await store.send(.onDisappear) // cancels the auto-poll loop
+  }
+
+  @Test func loadFailureSetsError() async {
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      $0.hermesProfiles.list = { @Sendable _ in throw RESTError.notFound }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in throw RESTError.unreachable }
+    }
+
+    await store.send(.task) {
+      $0.now = now
+      $0.isLoading = true
+    }
+    await store.receive(\.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.profilesResponse.failure)
+    await store.receive(\.sessionsResponse.failure) {
+      $0.isLoading = false
+      $0.loadError = RESTError.unreachable.message
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    await store.send(.onDisappear) // cancels the auto-poll loop
+  }
+
+  // MARK: Auto-poll (working glow freshness)
+
+  @Test func pollRefreshesAfterIntervalAndStopsOnDisappear() async {
+    let clock = TestClock()
+    let fetchCount = LockIsolated(0)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = clock
+      $0.hermesProfiles.list = { @Sendable _ in throw RESTError.notFound }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, source in
+        if source == .interactive { fetchCount.withValue { $0 += 1 } }
+        return [Session(id: "s1", isActive: true)]
+      }
+    }
+
+    // .task does the initial load and starts the 10s poll loop.
+    await store.send(.task) {
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.profilesResponse.failure)
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "s1", isActive: true)]
+      $0.statusSessions = [Session(id: "s1", isActive: true)]
+      $0.seenCounts = ["s1": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    #expect(fetchCount.value == 1)
+
+    // Advancing the clock by the interval fires a poll tick → refresh → re-fetch.
+    await clock.advance(by: .seconds(10))
+    await store.receive(\.pollTick)
+    await store.receive(\.pulledToRefresh) {
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+    }
+    #expect(fetchCount.value == 2)
+
+    // Disappearing cancels the loop — advancing further triggers no more refreshes.
+    await store.send(.onDisappear)
+    await clock.advance(by: .seconds(30))
+    #expect(fetchCount.value == 2)
+  }
+
+  @Test func pollTickIsSkippedWhileSearching() async {
+    let fetchCount = LockIsolated(0)
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, searchQuery: "foo")
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.continuousClock = TestClock()
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in
+        fetchCount.withValue { $0 += 1 }
+        return []
+      }
+      $0.hermesREST.search = { @Sendable _, _, _ in
+        fetchCount.withValue { $0 += 1 }
+        return []
+      }
+    }
+    // While a query is active the poll tick is a no-op — no refresh, no fetch of any kind.
+    await store.send(.pollTick)
+    await store.finish()
+    #expect(fetchCount.value == 0)
+  }
+
+  @Test func pollResumesAfterSuccessfulArchive() async {
+    // The archiving guard is transient: once archiveSucceeded clears it, a pollTick (not
+    // searching, archivingIDs empty) DOES refresh — the poll isn't permanently disabled.
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, archivingIDs: ["a"])
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [] }
+    }
+
+    // While the archive is in flight, the poll skips (guard non-empty).
+    await store.send(.pollTick)
+
+    // Success clears the transient guard (and cancels any in-flight fetch).
+    await store.send(.archiveSucceeded(id: "a")) {
+      $0.archivingIDs = []
+    }
+
+    // Now a poll tick refreshes again — the poll was only paused, not killed.
+    await store.send(.pollTick)
+    await store.receive(\.pulledToRefresh) {
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = []
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.isLoading = false
+      $0.cronJobsSupported = false
+    }
+  }
+
+  @Test func searchIsCancelledOnDisappear() async {
+    let clock = TestClock()
+    let fetchCount = LockIsolated(0)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.continuousClock = clock
+      $0.hermesREST.search = { @Sendable _, _, _ in
+        fetchCount.withValue { $0 += 1 }
+        return []
+      }
+    }
+
+    // Typing schedules a 300ms-debounced search…
+    await store.send(\.binding.searchQuery, "foo") { $0.searchQuery = "foo" }
+    // …but disappearing before the debounce fires cancels it.
+    await store.send(.onDisappear)
+    await clock.advance(by: .milliseconds(300))
+    await store.finish()
+    #expect(fetchCount.value == 0) // no .sessionsResponse — the debounced search was cancelled
+  }
+
+  @Test func changedNonemptySearchClearsPreviousFailure() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.continuousClock = clock
+      $0.hermesREST.search = { @Sendable _, query, _ in
+        if query == "failed" { throw RESTError.unreachable }
+        return [Session(id: "result", preview: query)]
+      }
+    }
+    await store.send(\.binding.searchQuery, "failed") { $0.searchQuery = "failed" }
+    await clock.advance(by: .milliseconds(300))
+    await store.receive(\.sessionsResponse.failure) {
+      $0.loadError = RESTError.unreachable.message
+    }
+    await store.send(\.binding.searchQuery, "replacement") {
+      $0.searchQuery = "replacement"
+      $0.loadError = nil
+    }
+    await clock.advance(by: .milliseconds(300))
+    await store.receive(\.sessionsResponse.success) {
+      $0.sessions = [Session(id: "result", preview: "replacement")]
+      $0.seenCounts = ["result": 0]
+    }
+    #expect(store.state.loadError == nil)
+    await store.finish()
+  }
+
+  @Test func searchIsDebouncedAndHitsSearchEndpoint() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.search = { @Sendable _, query, _ in
+        [Session(id: "r1", title: nil, preview: query)]
+      }
+      $0.continuousClock = clock
+    }
+
+    await store.send(\.binding.searchQuery, "foo") { $0.searchQuery = "foo" }
+    await clock.advance(by: .milliseconds(300))
+    await store.receive(\.sessionsResponse.success) {
+      $0.sessions = [Session(id: "r1", title: nil, preview: "foo")]
+      $0.seenCounts = ["r1": 0]
+    }
+  }
+
+  // MARK: Duplicate ids in the server response (#78)
+
+  /// The list AND search endpoints can return the same session id more than once;
+  /// `IdentifiedArray(uniqueElements:)` trapped on that in the field. The response must
+  /// dedupe by id, keeping the FIRST occurrence (server order), and seed `seenCounts`
+  /// from that first occurrence only.
+  @Test func sessionsResponseWithDuplicateIDsDedupesKeepingFirst() async {
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(.sessionsResponse(.success([
+      Session(id: "a", title: "First a", messageCount: 3),
+      Session(id: "b", title: "b", messageCount: 1),
+      Session(id: "a", title: "Second a", messageCount: 9),
+      Session(id: "b", title: "b again"),
+    ]))) {
+      $0.isLoading = false
+      $0.sessions = [
+        Session(id: "a", title: "First a", messageCount: 3),
+        Session(id: "b", title: "b", messageCount: 1),
+      ]
+      $0.statusSessions = $0.sessions
+      $0.seenCounts = ["a": 3, "b": 1]
+    }
+    #expect(store.state.sessions.map(\.id) == ["a", "b"])
+  }
+
+  /// A duplicate that is also filtered by the in-flight archive/delete guard stays gone —
+  /// the guard filter and the dedupe compose (neither re-admits the removed row).
+  @Test func sessionsResponseWithDuplicateIDsRespectsInFlightGuard() async {
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a"), Session(id: "b")]
+    )
+    initial.deletingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(.sessionsResponse(.success([
+      Session(id: "a"), Session(id: "b"), Session(id: "a"), Session(id: "b"),
+    ]))) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "b")]
+      $0.statusSessions = [Session(id: "b")]  // the in-flight guard applies here too
+      $0.seenCounts = ["b": 0]
+    }
+    #expect(store.state.seenCounts["a"] == nil)
+  }
+
+  /// End-to-end through the search path (the crash reports' primary trigger): the search
+  /// endpoint answering with a repeated id must land as a deduped list, not a trap.
+  @Test func searchResponseWithDuplicateIDsDoesNotTrap() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.search = { @Sendable _, query, _ in
+        [
+          Session(id: "r1", title: nil, preview: query),
+          Session(id: "r2", title: nil, preview: query),
+          Session(id: "r1", title: "dup", preview: query),
+        ]
+      }
+      $0.continuousClock = clock
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(\.binding.searchQuery, "foo") { $0.searchQuery = "foo" }
+    await clock.advance(by: .milliseconds(300))
+    await store.receive(\.sessionsResponse.success) {
+      $0.sessions = [
+        Session(id: "r1", title: nil, preview: "foo"),
+        Session(id: "r2", title: nil, preview: "foo"),
+      ]
+      $0.seenCounts = ["r1": 0, "r2": 0]
+    }
+  }
+
+  /// Same hardening for profiles: a duplicate `name` in `GET /api/profiles` (both the
+  /// initial probe and the post-create refresh) dedupes instead of trapping.
+  @Test func profilesResponseWithDuplicateNamesDedupesKeepingFirst() async {
+    let prefs = PreferencesClient.inMemory()
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, selectedProfileName: "work")
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, _ in [] }
+    }
+
+    let duplicated = [
+      Profile(name: "default", isDefault: true),
+      Profile(name: "work", model: "first"),
+      Profile(name: "work", model: "second"),
+    ]
+    await store.send(.profilesResponse(.success(duplicated))) {
+      $0.profilesSupported = true
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "work", model: "first")]
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = []
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.isLoading = false
+      $0.cronJobsSupported = false
+    }
+
+    await store.send(.profilesRefreshed(duplicated))
+    #expect(store.state.profiles.map(\.id) == ["default", "work"])
+    #expect(store.state.profiles[id: "work"]?.model == "first")
+  }
+
+  @Test func tappingSessionEmitsOpenDelegateAndMarksSeen() async {
+    let session = Session(id: "s1", title: "Hello", messageCount: 7)
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, sessions: [session], seenCounts: ["s1": 3])
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.sessionTapped("s1")) {
+      $0.seenCounts = ["s1": 7] // opening marks the session read at its current count
+    }
+    await store.receive(\.delegate.openSession)
+  }
+
+  // MARK: Unread + pagination
+
+  @Test func serverUnreadOverridesLegacyDeviceWatermark() {
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: [
+        Session(id: "server-unread", messageCount: 5, unread: true),   // equal local count, server wins
+        Session(id: "server-read", messageCount: 8, unread: false),   // local gap, server wins
+        Session(id: "legacy-unread", messageCount: 8),                // old agent fallback
+        Session(id: "legacy-unseeded", messageCount: 2),
+      ],
+      seenCounts: ["server-unread": 5, "server-read": 5, "legacy-unread": 5]
+    )
+    #expect(state.unreadSessionIDs == ["server-unread", "legacy-unread"])
+  }
+
+  // MARK: Pinning
+
+  @Test func searchDoesNotImportPinsOrCreateMigrationCheckpoint() async {
+    let prefs = PreferencesClient.inMemory()
+    let initial = SessionListFeature.State(
+      connection: connection, searchQuery: "find", seenCounts: ["a": 0],
+      selectedProfileName: "work", profilesSupported: true, cronJobsSupported: false
+    )
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(now)
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        return [Session(id: "a", pinned: false)] }
+    }
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: true)]))) {
+      $0.sessions = [Session(id: "a", pinned: true)]
+    }
+    await store.finish()
+    #expect(prefs.loadPinMigration(initial.pinMigrationServerID) == nil)
+    #expect(prefs.loadPinnedIDs().isEmpty)
+    await store.send(.binding(.set(\.searchQuery, ""))) {
+      $0.searchQuery = ""
+      $0.now = now
+      $0.isLoading = true
+      $0.seenCounts = [:]
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.seenCounts = ["a": 0]
+      $0.sessions = [Session(id: "a", pinned: false)]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.finish()
+    #expect(prefs.loadPinnedIDs().isEmpty)
+    #expect(prefs.loadPinMigration(initial.pinMigrationServerID)?.pendingIDs == [])
+  }
+
+  @Test(arguments: [true, false], ["default", "work"])
+  func searchIgnoresMembershipEvenWithKnownCapability(serverPinned: Bool, profile: String) async {
+    let prefs = PreferencesClient.inMemory()
+    let original = serverPinned ? ["keep", "legacy"] : ["keep", "legacy", "a"]
+    prefs.savePinnedIDs(original)
+    let initial = SessionListFeature.State(
+      connection: connection, searchQuery: "find", seenCounts: ["a": 0],
+      pinnedIDs: original, selectedProfileName: profile, profilesSupported: true
+    )
+    let migration = PinMigration(pendingIDs: original)
+    prefs.savePinMigration(initial.pinMigrationServerID, migration)
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+    }
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: serverPinned)]))) {
+      $0.sessions = [Session(id: "a", pinned: serverPinned)]
+    }
+    await store.finish()
+    #expect(store.state.pinnedIDs == original)
+    #expect(prefs.loadPinnedIDs() == original)
+    #expect(prefs.loadPinMigration(initial.pinMigrationServerID) == migration)
+  }
+
+  @Test(arguments: [true, false])
+  func searchExplicitMembershipIgnoresPendingLegacyMigration(serverPinned: Bool) async {
+    let prefs = PreferencesClient.inMemory()
+    let original = serverPinned ? ["legacy"] : ["legacy", "a"]
+    let expected = original
+    prefs.savePinnedIDs(original)
+    let initial = SessionListFeature.State(
+      connection: connection, searchQuery: "find", seenCounts: ["a": 0],
+      pinnedIDs: original, selectedProfileName: "work", profilesSupported: true
+    )
+    let migration = PinMigration(pendingIDs: ["a", "legacy"])
+    prefs.savePinMigration(initial.pinMigrationServerID, migration)
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in Issue.record("Search must not migrate") }
+    }
+    await store.send(.sessionsResponse(.success([Session(id: "a", pinned: serverPinned)]))) {
+      $0.sessions = [Session(id: "a", pinned: serverPinned)]
+    }
+    await store.finish()
+    #expect(prefs.loadPinnedIDs() == expected)
+    #expect(prefs.loadPinMigration(initial.pinMigrationServerID) == migration)
+  }
+
+  @Test(arguments: [true, false], ["pin", "other-profile-pin", "archive", "delete"])
+  func searchMembershipPreservesPendingOperations(serverPinned: Bool, operation: String) async {
+    let prefs = PreferencesClient.inMemory()
+    let original = serverPinned ? ["absent", "legacy"] : ["absent", "legacy", "a"]
+    prefs.savePinnedIDs(original)
+    var initial = SessionListFeature.State(
+      connection: connection, searchQuery: "find", seenCounts: ["a": 0, "legacy": 0, "other": 0],
+      pinnedIDs: original, selectedProfileName: "work", profilesSupported: true
+    )
+    switch operation {
+    case "pin", "other-profile-pin":
+      initial.pinMutations["a"] = .init(
+        pinned: !serverPinned, previousIndex: nil,
+        profileName: operation == "pin" ? "work" : "default"
+      )
+    case "archive": initial.archivingIDs = ["a"]
+    case "delete": initial.deletingIDs = ["a"]
+    default: break
+    }
+    let migration = PinMigration(pendingIDs: ["a", "legacy", "absent"])
+    prefs.savePinMigration(initial.pinMigrationServerID, migration)
+    let rows = [Session(id: "a", pinned: serverPinned), Session(id: "legacy"), Session(id: "other", pinned: true)]
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in Issue.record("Search must not migrate") }
+    }
+    await store.send(.sessionsResponse(.success(rows))) {
+      $0.sessions = IdentifiedArray(uniqueElements: rows.filter {
+        $0.id != "a" || (operation != "archive" && operation != "delete")
+      })
+    }
+    await store.finish()
+    #expect(!store.state.canChangePin(id: "a"))
+    #expect(prefs.loadPinnedIDs() == original)
+    #expect(prefs.loadPinMigration(initial.pinMigrationServerID) == migration)
+  }
+
+  @Test(arguments: [true, false], ["list", "search", "mixed-list", "mixed-search", "legacy-list", "legacy-search"])
+  func localFallbackPinChangesStayLocal(pinned: Bool, context: String) async {
+    let mixed = context.hasPrefix("mixed")
+    let legacy = context.hasPrefix("legacy")
+    let suite = "local-fallback-pins-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let prefs = PreferencesClient.live(defaults: defaults)
+    let original = pinned ? ["b", "c"] : ["b", "a", "c"]
+    let expected = pinned ? ["b", "c", "a"] : ["b", "c"]
+    prefs.savePinnedIDs(original)
+    let initial = SessionListFeature.State(
+      connection: connection,
+      sessions: IdentifiedArray(uniqueElements: [Session(id: "a")] + (mixed ? [Session(id: "explicit", pinned: false)] : [])),
+      searchQuery: context.hasSuffix("search") ? "find" : "",
+      pinnedIDs: original, selectedProfileName: legacy ? "default" : "work", profilesSupported: !legacy
+    )
+
+    let writes = LockIsolated(0)
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in
+        writes.withValue { $0 += 1 }
+        throw RESTError.unreachable
+      }
+    }
+    #expect(store.state.canChangePin(id: "a"))
+    await store.send(pinned ? .pinSession(id: "a") : .unpinSession(id: "a")) {
+      $0.pinnedIDs = expected
+    }
+    await store.finish()
+    #expect(PreferencesClient.live(defaults: defaults).loadPinnedIDs() == expected)
+    #expect(writes.value == 0)
+    #expect(store.state.pinMutations.isEmpty)
+    #expect(store.state.loadError == nil)
+    #expect(prefs.loadPinMigration(initial.pinMigrationServerID) == nil)
+  }
+
+  @Test(arguments: [true, false])
+  func explicitPinCapabilityWritesInMixedRows(pinned: Bool) async {
+    let prefs = PreferencesClient.inMemory()
+    let original = pinned ? ["legacy"] : ["legacy", "a"]
+    prefs.savePinnedIDs(original)
+    let initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [Session(id: "a", pinned: !pinned), Session(id: "legacy")],
+      pinnedIDs: original, selectedProfileName: "work", profilesSupported: true
+    )
+    let writes = LockIsolated(0)
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, id, value, profile in
+        #expect(id == "a" && value == pinned && profile == "work")
+        writes.withValue { $0 += 1 }
+      }
+    }
+    #expect(store.state.canChangePin(id: "a"))
+    await store.send(pinned ? .pinSession(id: "a") : .unpinSession(id: "a")) {
+      $0.pinnedIDs = pinned ? ["legacy", "a"] : ["legacy"]
+      $0.pinMutations["a"] = .init(
+        pinned: pinned, previousIndex: pinned ? nil : 1,
+        profileName: "work"
+      )
+    }
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations = [:]
+    }
+    await store.finish()
+    #expect(writes.value == 1)
+    #expect(prefs.loadPinnedIDs() == (pinned ? ["legacy", "a"] : ["legacy"]))
+  }
+
+  @Test func pinMigrationCompletedReconcilesExplicitPinsPreservingLocalOrderAndAbsentIDs() async {
+    let prefs = PreferencesClient.inMemory()
+    let originalPins = ["second", "absent", "legacy", "removed", "first"]
+    prefs.savePinnedIDs(originalPins)
+    prefs.savePinMigration(connection.baseURL.absoluteString, PinMigration(pendingIDs: []))
+    let sessions = [
+      Session(id: "first", pinned: true),
+      Session(id: "second", pinned: true),
+      Session(id: "removed", pinned: false),
+      Session(id: "legacy"),
+      Session(id: "legacy-unpinned"),
+      Session(id: "new", pinned: true),
+    ]
+    let expectedPins = ["second", "absent", "legacy", "first", "new"]
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection, pinnedIDs: originalPins,
+        selectedProfileName: "work", profilesSupported: true,
+        cronJobsSupported: false
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesProfiles.sessions = { @Sendable _, profile, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        #expect(profile == "work")
+        return sessions
+      }
+    }
+
+    await store.send(.pulledToRefresh) {
+      $0.now = now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = IdentifiedArray(uniqueElements: sessions)
+      $0.seenCounts = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, 0) })
+      $0.pinnedIDs = expectedPins
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.finish()
+    #expect(prefs.loadPinnedIDs() == expectedPins)
+    #expect(prefs.loadSeenCounts() == Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, 0) }))
+  }
+
+  @Test(arguments: ["work", "default"])
+  func pinMigrationCompletedUsesFirstDuplicateAndPersistsWithoutNewSeenCounts(profile: String) async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["false-first", "nil-first", "absent"])
+    prefs.savePinMigration(connection.baseURL.absoluteString, PinMigration(pendingIDs: []))
+    let rows = [
+      Session(id: "false-first", pinned: false), Session(id: "false-first", pinned: true),
+      Session(id: "nil-first"), Session(id: "nil-first", pinned: false),
+      Session(id: "new", pinned: true), Session(id: "new", pinned: false),
+      Session(id: "archiving", pinned: true), Session(id: "deleting", pinned: true),
+    ]
+    let counts = ["false-first": 4, "nil-first": 5, "new": 6]
+    prefs.saveSeenCounts(counts)
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, seenCounts: counts,
+      pinnedIDs: prefs.loadPinnedIDs(), archivingIDs: ["archiving"], deletingIDs: ["deleting"],
+      selectedProfileName: profile, profilesSupported: true, cronJobsSupported: false
+    )) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(now)
+      $0.hermesProfiles.sessions = { @Sendable _, name, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        #expect(name == profile) // includes literal "default", never nil
+        return rows
+      }
+    }
+    await store.send(.pulledToRefresh) {
+      $0.now = now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [rows[0], rows[2], rows[4]]
+      $0.pinnedIDs = ["nil-first", "absent", "new"]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.finish()
+    #expect(prefs.loadPinnedIDs() == ["nil-first", "absent", "new"])
+    #expect(prefs.loadSeenCounts() == counts)
+  }
+
+  @Test(arguments: ["work", "default", "legacy", "search"], [false, true])
+  func replacementFetchCancelsEarlierResult(context: String, fails: Bool) async {
+    let clock = TestClock()
+    let requests = LockIsolated(0)
+    let prefs = PreferencesClient.inMemory()
+    let rows = [Session(id: "fresh", pinned: true)]
+    @Sendable func fetch() async throws -> [Session] {
+      let request = requests.withValue { $0 += 1; return $0 }
+      if request == 1 {
+        do { try await clock.sleep(for: .seconds(1)) }
+        catch is CancellationError { /* Simulate an endpoint completing after cancellation. */ }
+        if fails { throw RESTError.unreachable }
+        return [Session(id: "stale", pinned: true)]
+      }
+      return rows
+    }
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, searchQuery: context == "search" ? "find" : "",
+      selectedProfileName: context == "default" ? "default" : "work",
+      profilesSupported: context != "legacy", cronJobsSupported: false
+    )) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(now)
+      $0.hermesProfiles.sessions = { @Sendable _, profile, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        #expect(profile == context)
+        return try await fetch()
+      }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        return try await fetch() }
+      $0.hermesREST.search = { @Sendable _, query, profile in
+        #expect(query == "find" && profile == "work")
+        return try await fetch()
+      }
+    }
+    await store.send(.pulledToRefresh) {
+      $0.now = now
+      $0.isLoading = true
+    }
+    await store.send(.pulledToRefresh)
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = IdentifiedArray(uniqueElements: rows)
+      $0.seenCounts = ["fresh": 0]
+      if context == "work" || context == "default" { $0.pinnedIDs = ["fresh"] }
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await clock.advance(by: .seconds(1))
+    await store.finish()
+    #expect(requests.value == 2)
+    #expect(prefs.loadPinnedIDs() == (context == "work" || context == "default" ? ["fresh"] : []))
+  }
+
+  @Test func whitespaceOnlyProfileQueryStillAppliesScopedListResponse() async {
+    let prefs = PreferencesClient.inMemory()
+    let sessions = [Session(id: "server-pinned", pinned: true)]
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, searchQuery: "   ", selectedProfileName: "work",
+      profilesSupported: true, cronJobsSupported: false
+    )) { SessionListFeature() } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesProfiles.sessions = { @Sendable _, profile, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        #expect(profile == "work")
+        return sessions
+      }
+    }
+
+    await store.send(.pulledToRefresh) {
+      $0.now = now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = IdentifiedArray(uniqueElements: sessions)
+      $0.seenCounts = ["server-pinned": 0]
+      $0.pinnedIDs = ["server-pinned"]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.finish()
+    #expect(prefs.loadPinnedIDs() == ["server-pinned"])
+  }
+
+  @Test func currentProfileListFailureSetsError() async {
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, profilesSupported: true, cronJobsSupported: false
+    )) { SessionListFeature() } withDependencies: {
+      $0.date = .constant(now)
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        throw RESTError.unreachable }
+    }
+    await store.send(.pulledToRefresh) {
+      $0.now = now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.failure) {
+      $0.isLoading = false
+      $0.loadError = RESTError.unreachable.message
+    }
+  }
+
+  @Test(arguments: [false, true])
+  func unscopedListAndScopedSearchPreservePins(search: Bool) async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["keep", "absent"])
+    let rows = [Session(id: "keep", pinned: false), Session(id: "new", pinned: true)]
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, searchQuery: search ? "find" : "",
+      pinnedIDs: ["keep", "absent"], profilesSupported: search, cronJobsSupported: false
+    )) { SessionListFeature() } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        return rows }
+      $0.hermesREST.search = { @Sendable _, _, _ in rows }
+    }
+    await store.send(.pulledToRefresh) {
+      $0.now = now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = IdentifiedArray(uniqueElements: rows)
+      $0.seenCounts = ["keep": 0, "new": 0]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.finish()
+    #expect(prefs.loadPinnedIDs() == ["keep", "absent"])
+  }
+
+  @Test func pinAndUnpinWriteProfileScopedServerMembership() async {
+    let writes = LockIsolated<[(String, Bool, String?)]>([])
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a", pinned: false)],
+      selectedProfileName: "work", profilesSupported: true, cronJobsSupported: false
+    )) { SessionListFeature() } withDependencies: {
+      $0.preferences = .inMemory()
+      $0.date = .constant(Date(timeIntervalSince1970: 0))
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        return [Session(id: "a", pinned: false)] }
+      $0.hermesREST.setPinned = { @Sendable _, id, pinned, profile in
+        writes.withValue { $0.append((id, pinned, profile)) }
+      }
+    }
+
+    await store.send(.pulledToRefresh) {
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.seenCounts = ["a": 0]
+      $0.statusSessions = $0.sessions
+    }
+    await store.send(.pinSession(id: "a")) {
+      $0.pinnedIDs = ["a"]
+      $0.pinMutations["a"] = .init(pinned: true, previousIndex: nil, profileName: "work")
+    }
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations["a"] = nil
+    }
+    await store.send(.unpinSession(id: "a")) {
+      $0.pinnedIDs = []
+      $0.pinMutations["a"] = .init(pinned: false, previousIndex: 0, profileName: "work")
+    }
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations["a"] = nil
+    }
+    await store.finish()
+    #expect(writes.value.map { $0.0 } == ["a", "a"])
+    #expect(writes.value.map { $0.1 } == [true, false])
+    #expect(writes.value.map { $0.2 } == ["work", "work"])
+  }
+
+  @Test(arguments: [true, false], [true, false])
+  func pinWriteProtectsPendingAndCompletedMembership(pinned: Bool, fails: Bool) async {
+    let clock = TestClock()
+    let prefs = PreferencesClient.inMemory()
+    let original = pinned ? ["other"] : ["a", "other"]
+    prefs.savePinnedIDs(original)
+    let initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a", pinned: !pinned)],
+      pinnedIDs: original, selectedProfileName: "work", profilesSupported: true,
+      cronJobsSupported: false
+    )
+    let writes = LockIsolated(0)
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(Date(timeIntervalSince1970: 0))
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        return [Session(id: "a", pinned: !pinned)]
+      }
+      $0.hermesREST.setPinned = { @Sendable _, id, value, profile in
+        #expect(id == "a" && value == pinned && profile == "work")
+        writes.withValue { $0 += 1 }
+        try await clock.sleep(for: .seconds(1))
+        if fails { throw RESTError.unreachable }
+      }
+    }
+    let optimistic = pinned ? ["other", "a"] : ["other"]
+    await store.send(pinned ? .pinSession(id: "a") : .unpinSession(id: "a")) {
+      $0.pinnedIDs = optimistic
+      $0.pinMutations["a"] = .init(
+        pinned: pinned, previousIndex: pinned ? nil : 0,
+        profileName: "work"
+      )
+    }
+    #expect(store.state.pinnedIDs == optimistic)
+    #expect(prefs.loadPinnedIDs() == optimistic)
+    #expect(store.state.pinMutations["a"] != nil)
+    // Both same-direction and opposite-direction duplicate toggles are ignored.
+    await store.send(.pinSession(id: "a"))
+    await store.send(.unpinSession(id: "a"))
+    #expect(store.state.pinnedIDs == optimistic)
+    await store.send(.pulledToRefresh) { $0.isLoading = true }
+    #expect(store.state.pinnedIDs == optimistic) // preference reload cannot erase optimism
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.seenCounts = ["a": 0]
+      $0.statusSessions = $0.sessions
+    }
+    #expect(store.state.pinnedIDs == optimistic) // stale server value while write pending
+    // A completion from a different profile cannot lift this operation's guard.
+    await store.send(.pinWriteFinished(id: "a", profileName: "other", error: .unreachable))
+    #expect(store.state.pinMutations["a"] != nil)
+    // An unrelated device-local preference addition must survive failure rollback.
+    // Another preference writer can add IDs independently of the pending row write.
+    prefs.savePinnedIDs(optimistic + ["b"])
+    await store.send(.pulledToRefresh) {
+      $0.isLoading = true
+      $0.pinnedIDs = optimistic + ["b"]
+    }
+    await store.receive(\.sessionsResponse.success) { $0.isLoading = false }
+    await clock.advance(by: .seconds(1))
+    let expected = (fails ? original : optimistic) + ["b"]
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations = [:]
+      $0.pinnedIDs = expected
+      if fails { $0.loadError = RESTError.unreachable.message }
+    }
+    #expect(store.state.pinnedIDs == expected)
+    #expect(prefs.loadPinnedIDs() == expected)
+    #expect(store.state.pinMutations.isEmpty)
+    #expect(writes.value == 1)
+    #expect(store.state.loadError == (fails ? RESTError.unreachable.message : nil))
+    await store.finish()
+  }
+
+  @Test(arguments: [true, false], 0..<16)
+  func pendingPinDoesNotBlockRemoval(archive: Bool, scenario: Int) async {
+    let pinFails = scenario & 1 != 0
+    let removalFails = scenario & 2 != 0
+    let pinFirst = scenario & 4 != 0
+    let pinned = scenario & 8 != 0
+    let clock = TestClock()
+    let prefs = PreferencesClient.inMemory()
+    let original = pinned ? ["other"] : ["a", "other"]
+    let optimistic = pinned ? ["other", "a"] : ["other"]
+    prefs.savePinnedIDs(original)
+    let row = Session(id: "a", pinned: !pinned)
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [row], pinnedIDs: original,
+      profilesSupported: true, cronJobsSupported: false
+    )
+    initial.confirmationDialog = ConfirmationDialogState { TextState("Remove?") }
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in
+        try await clock.sleep(for: .seconds(pinFirst ? 1 : 2))
+        if pinFails { throw RESTError.unreachable }
+      }
+      $0.hermesREST.archive = { @Sendable _, _, _, _ in
+        try await clock.sleep(for: .seconds(pinFirst ? 2 : 1))
+        if removalFails { throw RESTError.unreachable }
+      }
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in
+        try await clock.sleep(for: .seconds(pinFirst ? 2 : 1))
+        if removalFails { throw RESTError.unreachable }
+      }
+    }
+    await store.send(pinned ? .pinSession(id: "a") : .unpinSession(id: "a")) {
+      $0.pinnedIDs = optimistic
+      $0.pinMutations["a"] = .init(pinned: pinned, previousIndex: pinned ? nil : 0, profileName: "default")
+    }
+    await store.send(.confirmationDialog(.presented(archive ? .confirmArchive(id: "a") : .confirmDelete(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = []
+      if archive { $0.archivingIDs = ["a"] } else { $0.deletingIDs = ["a"] }
+    }
+    if archive { await store.receive(\.delegate.sessionArchived) }
+    else { await store.receive(\.delegate.sessionDeleted) }
+    func receivePin() async {
+      await store.receive(\.pinWriteFinished) {
+        $0.pinMutations = [:]
+        if pinFails {
+          if pinFirst || removalFails { $0.pinnedIDs = original }
+          $0.loadError = RESTError.unreachable.message
+        }
+      }
+    }
+    func receiveRemoval() async {
+      if removalFails {
+        if archive {
+          await store.receive(\.archiveFailed) {
+            $0.archivingIDs = []
+            $0.sessions = [row]
+            $0.loadError = "Couldn’t archive the session."
+          }
+        } else {
+          await store.receive(\.deleteFailed) {
+            $0.deletingIDs = []
+            $0.sessions = [row]
+            $0.loadError = "Couldn’t delete the session."
+          }
+        }
+      } else {
+        if archive {
+          await store.receive(\.archiveSucceeded) {
+            $0.archivingIDs = []
+            $0.pinnedIDs = ["other"]
+            $0.pinMutations["a"]?.previousIndex = nil
+          }
+        } else {
+          await store.receive(\.deleteSucceeded) {
+            $0.deletingIDs = []
+            $0.pinnedIDs = ["other"]
+            $0.pinMutations["a"]?.previousIndex = nil
+          }
+          await store.receive(\.delegate.sessionDeleteSucceeded)
+        }
+      }
+    }
+    await clock.advance(by: .seconds(1))
+    if pinFirst { await receivePin() } else { await receiveRemoval() }
+    await clock.advance(by: .seconds(1))
+    if pinFirst { await receiveRemoval() } else { await receivePin() }
+    #expect(prefs.loadPinnedIDs() == (removalFails ? (pinFails ? original : optimistic) : ["other"]))
+    await store.finish()
+  }
+
+  @Test(arguments: [true, false])
+  func archivedDeleteCompletesWhilePinIsPending(fails: Bool) async {
+    let row = Session(id: "a", pinned: true)
+    var initial = SessionListFeature.State(connection: connection, sessions: [row])
+    initial.archived = ArchivedSessionsFeature.State(connection: connection, sessions: [row])
+    initial.pinMutations["a"] = .init(
+      pinned: false, previousIndex: 0, profileName: "default"
+    )
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in
+        if fails { throw RESTError.unreachable }
+      }
+    }
+    await store.send(.archived(.presented(.deleteButtonTapped(id: "a")))) {
+      $0.archived?.sessions = []
+      $0.archived?.deletingIDs = ["a"]
+    }
+    await store.receive(\.archived.presented.delegate.deleted)
+    await store.receive(\.delegate.sessionDeleted)
+    if fails {
+      await store.receive(\.archivedDeleteFailed)
+      await store.receive(\.archived.presented.deleteFailed) {
+        $0.archived?.sessions = [row]
+        $0.archived?.deletingIDs = []
+        $0.archived?.loadError = "Couldn’t delete the session."
+      }
+    } else {
+      await store.receive(\.archivedDeleteSucceeded) {
+        $0.pinMutations["a"]?.previousIndex = nil
+      }
+      await store.receive(\.delegate.sessionDeleteSucceeded)
+      await store.receive(\.archived.presented.deleteSucceeded) { $0.archived?.deletingIDs = [] }
+    }
+    #expect(store.state.pinMutations["a"]?.previousIndex == (fails ? 0 : nil))
+    await store.finish()
+  }
+
+  @Test(arguments: [true, false], 0..<8)
+  func serverUnpinStartsAfterArchivedDelete(dismiss: Bool, scenario: Int) async {
+    let pinFails = scenario & 1 != 0
+    let deleteFails = scenario & 2 != 0
+    let pinFirst = scenario & 4 != 0
+    let clock = TestClock()
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["a", "other"])
+    let writes = LockIsolated(0)
+    let row = Session(id: "a", pinned: true)
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [row], pinnedIDs: ["a", "other"],
+      profilesSupported: true, cronJobsSupported: false
+    )
+    initial.archived = ArchivedSessionsFeature.State(connection: connection, sessions: [row])
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in
+        try await clock.sleep(for: .seconds(pinFirst ? 2 : 1))
+        if deleteFails { throw RESTError.unreachable }
+      }
+      $0.hermesREST.setPinned = { @Sendable _, id, pinned, profile in
+        #expect(id == "a")
+        #expect(!pinned)
+        #expect(profile == "default")
+        writes.withValue { $0 += 1 }
+        try await clock.sleep(for: .seconds(pinFirst ? 1 : 2))
+        if pinFails { throw RESTError.unreachable }
+      }
+    }
+    await store.send(.archived(.presented(.deleteButtonTapped(id: "a")))) {
+      $0.archived?.sessions = []
+      $0.archived?.deletingIDs = ["a"]
+    }
+    await store.receive(\.archived.presented.delegate.deleted)
+    await store.receive(\.delegate.sessionDeleted)
+    if dismiss {
+      await store.send(.archived(.dismiss)) { $0.archived = nil }
+    }
+    await store.send(.unpinSession(id: "a")) {
+      $0.pinnedIDs = ["other"]
+      $0.pinMutations["a"] = .init(pinned: false, previousIndex: 0, profileName: "default")
+    }
+    func receivePin() async {
+      await store.receive(\.pinWriteFinished) {
+        $0.pinMutations = [:]
+        if pinFails {
+          if pinFirst || deleteFails { $0.pinnedIDs = ["a", "other"] }
+          $0.loadError = RESTError.unreachable.message
+        }
+      }
+    }
+    func receiveDelete() async {
+      if deleteFails {
+        if dismiss {
+          await store.receive(\.archivedDeleteFailed) { $0.loadError = "Couldn’t delete the session." }
+        } else {
+          await store.receive(\.archivedDeleteFailed)
+        }
+        if !dismiss {
+          await store.receive(\.archived.presented.deleteFailed) {
+            $0.archived?.sessions = [row]
+            $0.archived?.deletingIDs = []
+            $0.archived?.loadError = "Couldn’t delete the session."
+          }
+        }
+      } else {
+        if pinFirst && !pinFails {
+          await store.receive(\.archivedDeleteSucceeded)
+        } else {
+          await store.receive(\.archivedDeleteSucceeded) {
+            $0.pinnedIDs = ["other"]
+            $0.pinMutations["a"]?.previousIndex = nil
+          }
+        }
+        await store.receive(\.delegate.sessionDeleteSucceeded)
+        if !dismiss {
+          await store.receive(\.archived.presented.deleteSucceeded) { $0.archived?.deletingIDs = [] }
+        }
+      }
+    }
+    await clock.advance(by: .seconds(1))
+    if pinFirst { await receivePin() } else { await receiveDelete() }
+    await clock.advance(by: .seconds(1))
+    if pinFirst { await receiveDelete() } else { await receivePin() }
+    #expect(writes.value == 1)
+    #expect(prefs.loadPinnedIDs() == (deleteFails && pinFails ? ["a", "other"] : ["other"]))
+    await store.finish()
+  }
+
+  @Test func unrelatedUnpinRemainsActionableWhilePinWriteIsPending() async {
+    let clock = TestClock()
+    let prefs = PreferencesClient.inMemory()
+    let original = ["a", "b", "c"]
+    prefs.savePinnedIDs(original)
+    let writes = LockIsolated<[String]>([])
+    let initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a", pinned: true), Session(id: "b", pinned: true)],
+      pinnedIDs: original, selectedProfileName: "work", profilesSupported: true,
+      cronJobsSupported: false
+    )
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, id, _, _ in
+        writes.withValue { $0.append(id) }
+        try await clock.sleep(for: .seconds(id == "a" ? 1 : 2))
+        if id == "a" { throw RESTError.unreachable }
+      }
+    }
+    await store.send(.unpinSession(id: "a")) {
+      $0.pinnedIDs = ["b", "c"]
+      $0.pinMutations["a"] = .init(pinned: false, previousIndex: 0, profileName: "work")
+    }
+    #expect(!store.state.canChangePin(id: "a"))
+    #expect(store.state.canChangePin(id: "b"))
+    await store.send(.unpinSession(id: "b")) {
+      $0.pinnedIDs = ["c"]
+      let mutation = SessionListFeature.PinMutation(pinned: false, previousIndex: 0, profileName: "work")
+      $0.pinMutations["b"] = mutation
+    }
+    #expect(store.state.pinnedIDs == ["c"])
+    #expect(prefs.loadPinnedIDs() == ["c"])
+    #expect(Set(store.state.pinMutations.keys) == ["a", "b"])
+    #expect(writes.value == ["a", "b"])
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations["a"] = nil
+      $0.pinnedIDs = ["a", "c"]
+      $0.loadError = RESTError.unreachable.message
+    }
+    #expect(store.state.pinnedIDs == ["a", "c"])
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.pinWriteFinished) { $0.pinMutations["b"] = nil }
+    await store.finish()
+    #expect(store.state.pinnedIDs == ["a", "c"])
+    #expect(prefs.loadPinnedIDs() == ["a", "c"])
+    #expect(store.state.pinMutations.isEmpty)
+  }
+
+  @Test(arguments: [true, false], [true, false])
+  func concurrentUnpinFailuresRestoreOnlyTheirIDAtBoundedPriorIndex(removeAFirst: Bool, finishAFirst: Bool) async {
+    let clockA = TestClock()
+    let clockB = TestClock()
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["a", "b", "c"])
+    let initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a", pinned: true), Session(id: "b", pinned: true)],
+      pinnedIDs: ["a", "b", "c"], selectedProfileName: "work", profilesSupported: true
+    )
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, id, _, _ in
+        try await (id == "a" ? clockA : clockB).sleep(for: .seconds(1))
+        throw RESTError.unreachable
+      }
+    }
+    await store.send(.unpinSession(id: removeAFirst ? "a" : "b")) {
+      $0.pinnedIDs = removeAFirst ? ["b", "c"] : ["a", "c"]
+      $0.pinMutations[removeAFirst ? "a" : "b"] = .init(
+        pinned: false, previousIndex: removeAFirst ? 0 : 1, profileName: "work"
+      )
+    }
+    await store.send(.unpinSession(id: removeAFirst ? "b" : "a")) {
+      $0.pinnedIDs = ["c"]
+      let mutation = SessionListFeature.PinMutation(pinned: false, previousIndex: 0, profileName: "work")
+      $0.pinMutations[removeAFirst ? "b" : "a"] = mutation
+    }
+    #expect(store.state.pinnedIDs == ["c"])
+    await (finishAFirst ? clockA : clockB).advance(by: .seconds(1))
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations[finishAFirst ? "a" : "b"] = nil
+      $0.pinnedIDs = finishAFirst ? ["a", "c"] : (removeAFirst ? ["b", "c"] : ["c", "b"])
+      $0.loadError = RESTError.unreachable.message
+    }
+    let restored = removeAFirst && finishAFirst ? ["b", "a", "c"]
+      : (!removeAFirst && !finishAFirst ? ["a", "c", "b"] : ["a", "b", "c"])
+    await (finishAFirst ? clockB : clockA).advance(by: .seconds(1))
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations = [:]
+      $0.pinnedIDs = restored
+    }
+    #expect(store.state.pinnedIDs == restored)
+    #expect(prefs.loadPinnedIDs() == restored)
+    await store.finish()
+  }
+
+  @Test(arguments: [true, false], [true, false])
+  func pinCompletionRestartsInFlightList(refreshBeforePin: Bool, fails: Bool) async {
+    let clock = TestClock()
+    let prefs = PreferencesClient.inMemory()
+    let requests = LockIsolated(0)
+    let initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a", pinned: false)],
+      selectedProfileName: "work", profilesSupported: true, cronJobsSupported: false
+    )
+
+    // This regression isolates user writes after the initial migration is complete.
+    prefs.savePinMigration(initial.pinMigrationServerID, PinMigration(pendingIDs: []))
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(Date(timeIntervalSince1970: 0))
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in
+        try await clock.sleep(for: .seconds(1))
+        if fails { throw RESTError.unreachable }
+      }
+      $0.hermesProfiles.sessions = { @Sendable _, profile, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        #expect(profile == "work")
+        let number = requests.withValue { $0 += 1; return $0 }
+        if number == 1 { try await Task.never() }
+        try await clock.sleep(for: .seconds(1))
+        return [Session(id: "a", pinned: !fails)]
+      }
+    }
+    if refreshBeforePin { await store.send(.pulledToRefresh) { $0.isLoading = true } }
+    await store.send(.pinSession(id: "a")) {
+      $0.pinnedIDs = ["a"]
+      $0.pinMutations["a"] = .init(pinned: true, previousIndex: nil, profileName: "work")
+    }
+    if !refreshBeforePin { await store.send(.pulledToRefresh) { $0.isLoading = true } }
+    #expect(store.state.isLoading)
+    #expect(prefs.loadPinnedIDs() == ["a"])
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations = [:]
+      $0.isLoading = true
+      if fails {
+        $0.pinnedIDs = []
+        $0.loadError = RESTError.unreachable.message
+      }
+    }
+    #expect(store.state.pinMutations.isEmpty)
+    #expect(store.state.loadError == (fails ? RESTError.unreachable.message : nil))
+    let expectedPins = fails ? [] : ["a"]
+    #expect(store.state.pinnedIDs == expectedPins)
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "a", pinned: !fails)]
+      $0.seenCounts = ["a": 0]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(store.state.isLoading == false)
+    #expect(store.state.sessions[id: "a"]?.pinned == !fails)
+    #expect(store.state.pinnedIDs == expectedPins)
+    #expect(requests.value == 2)
+    await store.finish()
+  }
+
+  @Test(arguments: [true, false])
+  func pinCompletionRestartsCurrentSearch(fails: Bool) async {
+    let clock = TestClock()
+    let fetchClock = TestClock()
+    let prefs = PreferencesClient.inMemory()
+    let requests = LockIsolated<[String]>([])
+    let initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a", pinned: false)],
+      selectedProfileName: "work", profilesSupported: true, cronJobsSupported: false
+    )
+
+    // This regression isolates user writes after the initial migration is complete.
+    prefs.savePinMigration(initial.pinMigrationServerID, PinMigration(pendingIDs: []))
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(Date(timeIntervalSince1970: 0))
+      $0.continuousClock = clock
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in
+        try await clock.sleep(for: .seconds(1))
+        if fails { throw RESTError.unreachable }
+      }
+      $0.hermesREST.search = { @Sendable _, query, _ in
+        let number = requests.withValue { $0.append(query); return $0.count }
+        if number == 1 { try await Task.never() }
+        try await fetchClock.sleep(for: .seconds(1))
+        return [Session(id: "fresh")]
+      }
+    }
+    await store.send(.pinSession(id: "a")) {
+      $0.pinnedIDs = ["a"]
+      $0.pinMutations["a"] = .init(pinned: true, previousIndex: nil, profileName: "work")
+    }
+    await store.send(.binding(.set(\.searchQuery, "latest"))) { $0.searchQuery = "latest" }
+    await clock.advance(by: .milliseconds(300))
+    await clock.advance(by: .milliseconds(700))
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations = [:]
+      $0.isLoading = true
+      if fails {
+        $0.pinnedIDs = []
+        $0.loadError = RESTError.unreachable.message
+      }
+    }
+    #expect(store.state.isLoading)
+    #expect(store.state.pinMutations.isEmpty)
+    #expect(store.state.loadError == (fails ? RESTError.unreachable.message : nil))
+    let expectedPins = fails ? [] : ["a"]
+    #expect(store.state.pinnedIDs == expectedPins)
+    await fetchClock.advance(by: .seconds(1))
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "fresh")]
+      $0.seenCounts = ["fresh": 0]
+    }
+    #expect(store.state.sessions.ids == ["fresh"])
+    #expect(!store.state.isLoading)
+    #expect(store.state.pinnedIDs == expectedPins)
+    #expect(requests.value == ["latest", "latest"])
+    await store.finish()
+  }
+
+  @Test func profileRoundTripAndSearchClearCancelEarlierRequests() async {
+    let clock = TestClock()
+    let prefs = PreferencesClient.inMemory()
+    let store = TestStore(initialState: SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "work")], selectedProfileName: "work",
+      profilesSupported: true, cronJobsSupported: false
+    )) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(Date(timeIntervalSince1970: 0))
+      $0.continuousClock = clock
+      $0.hermesProfiles.sessions = { @Sendable _, name, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        if name == "other" { try await clock.sleep(for: .seconds(1)) }
+        return [Session(id: name)]
+      }
+      $0.hermesREST.search = { @Sendable _, _, _ in
+        try await clock.sleep(for: .seconds(1))
+        return [Session(id: "search", pinned: true)]
+      }
+    }
+    await store.send(.selectProfile(name: "other")) {
+      $0.selectedProfileName = "other"
+      $0.sessions = []
+      $0.isLoading = true
+    }
+    // The replacement fetch cancels the delayed other-profile request.
+    await store.send(.selectProfile(name: "work")) {
+      $0.selectedProfileName = "work"
+      $0.sessions = []
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "work")]
+      $0.seenCounts = ["work": 0]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await store.send(\.binding.searchQuery, "find") { $0.searchQuery = "find" }
+    await clock.advance(by: .milliseconds(300))
+    await store.send(\.binding.searchQuery, "") {
+      $0.searchQuery = ""
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) { $0.isLoading = false }
+    await clock.advance(by: .seconds(2))
+    await store.finish()
+    #expect(prefs.loadPinnedIDs().isEmpty)
+  }
+
+  // Legacy list and capable search rows retain their unavailable-row guards.
+  @Test(arguments: ["missing", "pinning", "legacy-missing"], [true, false])
+  func pinChangesRequireAvailableRows(context: String, pinned: Bool) async {
+    let legacy = context.hasPrefix("legacy-")
+    let guardContext = legacy ? String(context.dropFirst("legacy-".count)) : context
+    let prefs = PreferencesClient.inMemory()
+    let original = pinned ? ["other"] : ["other", "a"]
+    prefs.savePinnedIDs(original)
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: guardContext == "missing" ? [] : [Session(id: "a", pinned: legacy ? nil : !pinned, source: legacy ? nil : "work")],
+      searchQuery: legacy ? "" : "find", pinnedIDs: original,
+      archivingIDs: guardContext == "archiving" ? ["a"] : [],
+      deletingIDs: guardContext == "deleting" ? ["a"] : [],
+      selectedProfileName: legacy ? "default" : "work", profilesSupported: !legacy, cronJobsSupported: false
+    )
+    if context == "pinning" {
+      initial.pinMutations["a"] = .init(
+        pinned: !pinned, previousIndex: nil, profileName: "work"
+      )
+    }
+    let writes = LockIsolated(0)
+    let saves = LockIsolated(0)
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.preferences.savePinnedIDs = { ids in
+        saves.withValue { $0 += 1 }
+        prefs.savePinnedIDs(ids)
+      }
+      $0.hermesREST.setPinned = { @Sendable _, _, _, _ in writes.withValue { $0 += 1 } }
+    }
+    #expect(!store.state.canChangePin(id: "a"))
+    await store.send(pinned ? .pinSession(id: "a") : .unpinSession(id: "a"))
+    await store.finish()
+    #expect(prefs.loadPinnedIDs() == original)
+    #expect(saves.value == 0)
+    #expect(writes.value == 0)
+    #expect(!store.state.canChangePin(id: "a"))
+  }
+
+  @Test func pinFailureAfterProfileRoundTripRestoresOnlyItsPriorMembership() async {
+    let clock = TestClock()
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["a"])
+    let initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a", pinned: true)], pinnedIDs: ["a"],
+      selectedProfileName: "work", profilesSupported: true, cronJobsSupported: false
+    )
+    let store = TestStore(initialState: initial) { SessionListFeature() } withDependencies: {
+      $0.preferences = prefs
+      $0.date = .constant(Date(timeIntervalSince1970: 0))
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, source in
+        guard source == .interactive else { return [] }
+        return [Session(id: "a", pinned: false)] }
+      $0.hermesREST.setPinned = { @Sendable _, _, _, profile in
+        #expect(profile == "work")
+        try await clock.sleep(for: .seconds(1))
+        throw RESTError.unreachable
+      }
+    }
+    await store.send(.unpinSession(id: "a")) {
+      $0.pinnedIDs = []
+      $0.pinMutations["a"] = .init(pinned: false, previousIndex: 0, profileName: "work")
+    }
+    await store.send(.selectProfile(name: "other")) {
+      $0.selectedProfileName = "other"
+      $0.sessions = []
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "a", pinned: false)]
+      $0.seenCounts = ["a": 0]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    #expect(store.state.pinnedIDs.isEmpty)
+    await store.send(.selectProfile(name: "work")) {
+      $0.selectedProfileName = "work"
+      $0.sessions = []
+      $0.isLoading = true
+      $0.statusSessions = nil
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "a", pinned: false)]
+      if !$0.isSearching { $0.statusSessions = $0.sessions }
+    }
+    await clock.advance(by: .seconds(1))
+    await store.receive(\.pinWriteFinished) {
+      $0.pinMutations = [:]
+      $0.pinnedIDs = ["a"]
+      $0.loadError = RESTError.unreachable.message
+    }
+    #expect(store.state.selectedProfileName == "work")
+    #expect(store.state.pinnedIDs == ["a"])
+    #expect(prefs.loadPinnedIDs() == ["a"])
+    #expect(store.state.pinMutations.isEmpty)
+    #expect(store.state.loadError == RESTError.unreachable.message)
+    await store.finish()
+  }
+
+  @Test func pinMovesSessionIntoPinnedSetAndOutOfMainLane() async {
+    let prefs = PreferencesClient.inMemory()
+    let sessions = [
+      Session(id: "a", cwd: "/w", startedAt: Date(timeIntervalSince1970: 1)),
+      Session(id: "b", cwd: "/w", startedAt: Date(timeIntervalSince1970: 2)),
+    ]
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, sessions: IdentifiedArray(uniqueElements: sessions))
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+    }
+
+    #expect(store.state.pinnedSessions.isEmpty)
+    #expect(store.state.unpinnedSessions.map(\.id) == ["a", "b"])
+
+    await store.send(.pinSession(id: "a")) {
+      $0.pinnedIDs = ["a"]
+    }
+    #expect(store.state.pinnedSessions.map(\.id) == ["a"])
+    #expect(store.state.unpinnedSessions.map(\.id) == ["b"]) // pinned dropped from the main lane
+    #expect(prefs.loadPinnedIDs() == ["a"]) // persisted
+  }
+
+  @Test func unpinRestoresSessionToMainLane() async {
+    let prefs = PreferencesClient.inMemory()
+    let sessions = [
+      Session(id: "a", cwd: "/w", startedAt: Date(timeIntervalSince1970: 1)),
+      Session(id: "b", cwd: "/w", startedAt: Date(timeIntervalSince1970: 2)),
+    ]
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: IdentifiedArray(uniqueElements: sessions),
+        pinnedIDs: ["a"]
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+    }
+
+    #expect(store.state.pinnedSessions.map(\.id) == ["a"])
+
+    await store.send(.unpinSession(id: "a")) {
+      $0.pinnedIDs = []
+    }
+    #expect(store.state.pinnedSessions.isEmpty)
+    #expect(store.state.unpinnedSessions.map(\.id) == ["a", "b"]) // restored to the main lane
+    #expect(prefs.loadPinnedIDs() == []) // persisted
+  }
+
+  @Test func pinnedSessionsFollowPinInsertionOrder() async {
+    let prefs = PreferencesClient.inMemory()
+    // `sessions` array order is a, b — but pinning b first then a should yield [b, a].
+    let sessions = [Session(id: "a", pinned: false), Session(id: "b", pinned: false)]
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, sessions: IdentifiedArray(uniqueElements: sessions), profilesSupported: true)
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.setPinned = { @Sendable _, _, _, profile in #expect(profile == "default") }
+    }
+
+    await store.send(.pinSession(id: "b")) {
+      $0.pinnedIDs = ["b"]
+      $0.pinMutations["b"] = .init(pinned: true, previousIndex: nil, profileName: "default")
+    }
+    await store.receive(\.pinWriteFinished) { $0.pinMutations = [:] }
+    await store.send(.pinSession(id: "a")) {
+      $0.pinnedIDs = ["b", "a"]
+      $0.pinMutations["a"] = .init(pinned: true, previousIndex: nil, profileName: "default")
+    }
+    await store.receive(\.pinWriteFinished) { $0.pinMutations = [:] }
+    // Pin order, not session-array order.
+    #expect(store.state.pinnedSessions.map(\.id) == ["b", "a"])
+  }
+
+  @Test func stalePinnedIDIsIgnored() {
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: [Session(id: "a")],
+      pinnedIDs: ["a", "ghost"] // "ghost" no longer exists
+    )
+    #expect(state.pinnedSessions.map(\.id) == ["a"]) // stale id dropped
+  }
+
+  // MARK: Copy session ID (transient toast)
+
+  // The reducer copies the tapped id verbatim — it deliberately does NOT look the session
+  // up in `state.sessions`, because the id always comes from a row rendered from that
+  // array. No fixture is seeded here, so the test can't pretend otherwise.
+  @Test func copyIDPutsSessionIDOnPasteboardAndAutoDismissesToast() async {
+    let copied = LockIsolated<String?>(nil)
+    let clock = TestClock()
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.pasteboard.copy = { @Sendable text in copied.setValue(text) }
+      $0.continuousClock = clock
+    }
+
+    await store.send(.copyIDButtonTapped(id: "s1")) { $0.copiedIDToastToken = 1 }
+
+    await clock.advance(by: .seconds(1.5))
+    await store.receive(\.copiedIDToastExpired) { $0.copiedIDToastToken = nil }
+    // Asserted after the effects have been drained — `send` alone doesn't guarantee the
+    // merged copy effect has run.
+    #expect(copied.value == "s1")
+  }
+
+  @Test func recopyingWhileToastVisibleRestartsTheDwellTimer() async {
+    let copied = LockIsolated<[String]>([])
+    let clock = TestClock()
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.pasteboard.copy = { @Sendable text in copied.withValue { $0.append(text) } }
+      $0.continuousClock = clock
+    }
+
+    await store.send(.copyIDButtonTapped(id: "a")) { $0.copiedIDToastToken = 1 }
+    await clock.advance(by: .seconds(1)) // first dwell is 2/3 elapsed…
+    // …a second copy cancels it (cancelInFlight) so the toast does NOT dismiss early. The
+    // token bumps even though the toast never hid — that bump is what the view turns into
+    // a second VoiceOver announcement.
+    await store.send(.copyIDButtonTapped(id: "b")) { $0.copiedIDToastToken = 2 }
+    await clock.advance(by: .seconds(1)) // past the first timer's deadline — still visible
+    #expect(store.state.copiedIDToastToken == 2)
+
+    await clock.advance(by: .seconds(0.5)) // completes the restarted dwell
+    await store.receive(\.copiedIDToastExpired) { $0.copiedIDToastToken = nil }
+    #expect(copied.value == ["a", "b"])
+  }
+
+  // MARK: Cron partition
+
+
+
+
+  @Test func cronSessionsAreRecencyOrderedAndExcludedFromInteractiveSections() {
+    let sessions = [
+      Session(id: "i1", updatedAt: Date(timeIntervalSince1970: 10), cwd: "/w", startedAt: Date(timeIntervalSince1970: 1)),
+      Session(id: "c1", updatedAt: Date(timeIntervalSince1970: 5), source: "cron"),
+      Session(id: "i2", updatedAt: Date(timeIntervalSince1970: 20), cwd: "/w", startedAt: Date(timeIntervalSince1970: 2)),
+      Session(id: "c2", updatedAt: Date(timeIntervalSince1970: 50), source: "cron"),
+      Session(id: "c3", updatedAt: nil, source: "cron"), // nil date sorts last
+    ]
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: IdentifiedArray(uniqueElements: sessions)
+    )
+
+    // Cron rows only, recency-ordered (c2 > c1 > c3 with nil last).
+    #expect(state.cronSessions.map(\.id) == ["c2", "c1", "c3"])
+    // Interactive sections see only non-cron rows.
+    #expect(state.interactiveSessions.map(\.id) == ["i1", "i2"])
+    #expect(state.chronologicalSessions.map(\.id) == ["i2", "i1"]) // updatedAt desc
+    let sectionedIDs = state.dateSections.flatMap { $0.entries.map(\.id) }
+    #expect(sectionedIDs == ["i2", "i1"])
+    #expect(sectionedIDs.contains(where: { $0.hasPrefix("c") }) == false)
+  }
+
+  @Test func pinnedCronSessionSurfacesOnlyUnderCronJobs() {
+    let sessions = [
+      Session(id: "c1", updatedAt: Date(timeIntervalSince1970: 5), source: "cron"),
+      Session(id: "i1", cwd: "/w", startedAt: Date(timeIntervalSince1970: 1)),
+    ]
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: IdentifiedArray(uniqueElements: sessions),
+      pinnedIDs: ["c1"] // pinned, but also cron
+    )
+
+    #expect(state.cronSessions.map(\.id) == ["c1"]) // appears under Cron Jobs
+    #expect(state.pinnedSessions.isEmpty) // NOT in pinned
+    #expect(state.chronologicalSessions.map(\.id) == ["i1"]) // not in interactive list either
+  }
+
+
+  // MARK: Branch nesting per lane
+
+
+
+
+
+
+
+
+
+  @Test func noCronSessionsLeavesInteractiveListUnchanged() {
+    let sessions = [
+      Session(id: "a", updatedAt: Date(timeIntervalSince1970: 10), cwd: "/w", startedAt: Date(timeIntervalSince1970: 1)),
+      Session(id: "b", updatedAt: Date(timeIntervalSince1970: 20), cwd: "/w", startedAt: Date(timeIntervalSince1970: 2)),
+    ]
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: IdentifiedArray(uniqueElements: sessions),
+      pinnedIDs: ["a"]
+    )
+
+    #expect(state.cronSessions.isEmpty)
+    // Interactive computeds behave exactly as before the cron partition.
+    #expect(state.interactiveSessions.map(\.id) == ["a", "b"])
+    #expect(state.pinnedSessions.map(\.id) == ["a"])
+    #expect(state.unpinnedSessions.map(\.id) == ["b"])
+    #expect(state.chronologicalSessions.map(\.id) == ["b"])
+    #expect(state.dateSections.flatMap { $0.entries.map(\.id) } == ["b"])
+  }
+
+  @Test func branchNestsUnderParentInChronologicalLane() {
+    let sessions = [
+      Session(id: "other", updatedAt: Date(timeIntervalSince1970: 30)),
+      Session(id: "parent", updatedAt: Date(timeIntervalSince1970: 10)),
+      Session(id: "branch", updatedAt: Date(timeIntervalSince1970: 20), parentSessionID: "parent"),
+    ]
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: IdentifiedArray(uniqueElements: sessions)
+    )
+
+    // Plain chronological order would be other > branch > parent; the entries lane nests
+    // the branch under its parent (elbow stem) and sorts the cluster by its freshest
+    // member (the branch at 20), still below "other" (30).
+    #expect(state.chronologicalEntries.map(\.id) == ["other", "parent", "branch"])
+    #expect(state.chronologicalEntries.map(\.branchStem) == [nil, nil, "└─ "])
+  }
+
+  @Test func pinnedBranchDeNestsInPinnedLane() {
+    let sessions = [
+      Session(id: "parent", updatedAt: Date(timeIntervalSince1970: 10)),
+      Session(id: "branch", updatedAt: Date(timeIntervalSince1970: 20), parentSessionID: "parent"),
+    ]
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: IdentifiedArray(uniqueElements: sessions),
+      pinnedIDs: ["branch"]
+    )
+
+    // The pinned slice doesn't contain the parent → the branch renders as a normal row.
+    #expect(state.pinnedEntries.map(\.id) == ["branch"])
+    #expect(state.pinnedEntries.map(\.branchStem) == [nil])
+    // The parent stays in the main lane, unstemmed and without its pinned child.
+    #expect(state.chronologicalEntries.map(\.id) == ["parent"])
+    #expect(state.chronologicalEntries.map(\.branchStem) == [nil])
+  }
+
+  @Test func pinnedLaneKeepsPinOrderAndNestsWithinPinnedSlice() {
+    let sessions = [
+      Session(id: "a", updatedAt: Date(timeIntervalSince1970: 1)),
+      Session(id: "parent", updatedAt: Date(timeIntervalSince1970: 2)),
+      Session(id: "branch", updatedAt: Date(timeIntervalSince1970: 30), parentSessionID: "parent"),
+    ]
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: IdentifiedArray(uniqueElements: sessions),
+      pinnedIDs: ["a", "parent", "branch"] // "a" pinned first despite being oldest
+    )
+
+    // Both parent and branch are pinned → they nest, but top-level order stays the
+    // user's pin order (a recency sort would have lifted the parent cluster above "a").
+    #expect(state.pinnedEntries.map(\.id) == ["a", "parent", "branch"])
+    #expect(state.pinnedEntries.map(\.branchStem) == [nil, nil, "└─ "])
+  }
+
+  @Test func cronRowsStayOutOfBranchNesting() {
+    let sessions = [
+      Session(id: "parent", updatedAt: Date(timeIntervalSince1970: 10)),
+      Session(
+        id: "cron_job1_1", updatedAt: Date(timeIntervalSince1970: 20),
+        source: "cron", parentSessionID: "parent"
+      ),
+    ]
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: IdentifiedArray(uniqueElements: sessions)
+    )
+
+    // The cron partition runs FIRST: a cron row never nests into (or lifts) the
+    // interactive lanes, and the cron section itself stays flat.
+    #expect(state.chronologicalEntries.map(\.id) == ["parent"])
+    #expect(state.chronologicalEntries.map(\.branchStem) == [nil])
+    #expect(state.cronSessions.map(\.id) == ["cron_job1_1"])
+  }
+
+  @Test func searchResultsStayFlatInServerOrder() async {
+    let clock = TestClock()
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.search = { @Sendable _, _, _ in
+        [
+          Session(id: "branch", updatedAt: Date(timeIntervalSince1970: 20), parentSessionID: "parent"),
+          Session(id: "other", updatedAt: Date(timeIntervalSince1970: 15)),
+          Session(id: "parent", updatedAt: Date(timeIntervalSince1970: 10)),
+        ]
+      }
+      $0.continuousClock = clock
+    }
+
+    await store.send(\.binding.searchQuery, "foo") { $0.searchQuery = "foo" }
+    await clock.advance(by: .milliseconds(300))
+    await store.receive(\.sessionsResponse.success) {
+      $0.sessions = [
+        Session(id: "branch", updatedAt: Date(timeIntervalSince1970: 20), parentSessionID: "parent"),
+        Session(id: "other", updatedAt: Date(timeIntervalSince1970: 15)),
+        Session(id: "parent", updatedAt: Date(timeIntervalSince1970: 10)),
+      ]
+      $0.seenCounts = ["branch": 0, "other": 0, "parent": 0]
+    }
+    // Search renders `sessions` directly (flat, server relevance order) — a branch in the
+    // results is NOT regrouped under its parent.
+    #expect(store.state.isSearching)
+    #expect(store.state.sessions.map(\.id) == ["branch", "other", "parent"])
+  }
+
+  @Test func taskLoadsPinnedIDsFromPreferences() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePinnedIDs(["s1"])
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      $0.preferences = prefs
+      $0.hermesProfiles.list = { @Sendable _ in throw RESTError.notFound }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [Session(id: "s1")] }
+    }
+
+    await store.send(.task) {
+      $0.now = self.now
+      $0.isLoading = true
+      $0.pinnedIDs = ["s1"]
+    }
+    await store.receive(\.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.profilesResponse.failure)
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "s1")]
+      $0.statusSessions = [Session(id: "s1")]
+      $0.seenCounts = ["s1": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    await store.send(.onDisappear) // cancels the auto-poll loop
+  }
+
+
+  // MARK: Archiving
+
+  @Test func archiveButtonPresentsConfirmationDialog() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, sessions: [Session(id: "a")])
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.archiveButtonTapped(id: "a")) {
+      $0.confirmationDialog = ConfirmationDialogState {
+        TextState("Archive session?")
+      } actions: {
+        ButtonState(role: .destructive, action: .confirmArchive(id: "a")) {
+          TextState("Archive")
+        }
+        ButtonState(role: .cancel) {
+          TextState("Cancel")
+        }
+      } message: {
+        TextState("This hides the session from the list. You can restore it from the server.")
+      }
+    }
+  }
+
+  @Test func cancellingDialogKeepsSession() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, sessions: [Session(id: "a")])
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.archiveButtonTapped(id: "a")) {
+      $0.confirmationDialog = ConfirmationDialogState {
+        TextState("Archive session?")
+      } actions: {
+        ButtonState(role: .destructive, action: .confirmArchive(id: "a")) {
+          TextState("Archive")
+        }
+        ButtonState(role: .cancel) {
+          TextState("Cancel")
+        }
+      } message: {
+        TextState("This hides the session from the list. You can restore it from the server.")
+      }
+    }
+    // Dismissing (cancel) clears the dialog and leaves the session in place.
+    await store.send(.confirmationDialog(.dismiss)) {
+      $0.confirmationDialog = nil
+    }
+    #expect(store.state.sessions.map(\.id) == ["a"])
+  }
+
+  @Test func confirmArchiveRemovesSessionOptimisticallyAndCallsRPC() async {
+    let prefs = PreferencesClient.inMemory()
+    let archived = LockIsolated<[(String, Bool)]>([])
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [Session(id: "a"), Session(id: "b")],
+      seenCounts: ["a": 1, "b": 2],
+      pinnedIDs: ["a"]
+    )
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Archive session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmArchive(id: "a")) { TextState("Archive") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.archive = { @Sendable _, id, flag, _ in
+        archived.withValue { $0.append((id, flag)) }
+      }
+    }
+
+    await store.send(.confirmationDialog(.presented(.confirmArchive(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = [Session(id: "b")]
+      $0.pinnedIDs = []
+      $0.seenCounts = ["b": 2]
+      $0.archivingIDs = ["a"] // in-flight guard while the PATCH runs
+    }
+    // The parent is told FIRST (it tears the live-chat slot down when it matches).
+    await store.receive(\.delegate.sessionArchived)
+    // Success clears the transient guard (so the poll resumes) and cancels any stale in-flight
+    // fetch — no permanent filter (server now excludes the archived session anyway).
+    await store.receive(\.archiveSucceeded) {
+      $0.archivingIDs = []
+    }
+    await store.finish()
+    #expect(store.state.archivingIDs.isEmpty)
+    #expect(archived.value.count == 1)
+    #expect(archived.value.first?.0 == "a")
+    #expect(archived.value.first?.1 == true)
+    #expect(prefs.loadPinnedIDs() == [])
+    #expect(prefs.loadSeenCounts() == ["b": 2]) // archived session's seen baseline persisted-cleared
+  }
+
+  @Test func staleLoadAfterArchiveDoesNotResurrectSession() async {
+    // A list fetch already in flight when the user archives a session must NOT land
+    // afterward and re-add the just-removed row. `confirmArchive` cancels it — and
+    // because that leaves `isLoading` stranded, `archiveSucceeded` RESTARTS the fetch:
+    // the fresh, post-archive response (without "a") lands and clears the spinner.
+    let prefs = PreferencesClient.inMemory()
+    let calls = LockIsolated(0)
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [Session(id: "a"), Session(id: "b")]
+    )
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Archive session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmArchive(id: "a")) { TextState("Archive") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      $0.preferences = prefs
+      $0.hermesREST.archive = { @Sendable _, _, _, _ in }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in
+        // First call (in flight at confirm time) parks forever with the STALE list —
+        // cancelled, its response must never arrive. Second call (the restart) returns
+        // the authoritative post-archive list.
+        if calls.withValue({ $0 += 1; return $0 }) == 1 { try await Task.never() }
+        return [Session(id: "b")]
+      }
+    }
+
+    // Kick off a load that parks inside the fetch (the response can't land yet).
+    await store.send(.pulledToRefresh) {
+      $0.now = self.now
+      $0.isLoading = true
+    }
+
+    // Archive "a" — this cancels the in-flight load and optimistically drops the row.
+    await store.send(.confirmationDialog(.presented(.confirmArchive(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = [Session(id: "b")]
+      $0.archivingIDs = ["a"]
+    }
+    // The parent notification precedes the PATCH bookkeeping.
+    await store.receive(\.delegate.sessionArchived)
+    // Success clears the guard and — with a load still pending — restarts the fetch.
+    await store.receive(\.archiveSucceeded) {
+      $0.archivingIDs = []
+    }
+    // Only the RESTARTED fetch's authoritative response arrives; "a" stays archived.
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "b")]
+      $0.statusSessions = [Session(id: "b")]
+      $0.seenCounts = ["b": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    await store.finish()
+    #expect(store.state.sessions.map(\.id) == ["b"])
+  }
+
+  @Test func archiveFailureRestoresSessionLocallyAndSetsError() async {
+    // On failure the optimistic removal is reversed LOCALLY (no reliance on a reload): the
+    // session is re-inserted at its saved index, the guard is lifted, and the error is set.
+    // `rest.sessions` throws on reload — proving the row is back purely from the local restore.
+    let session = Session(id: "a", title: "Keep me")
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [session, Session(id: "b")]
+    )
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Archive session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmArchive(id: "a")) { TextState("Archive") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.hermesREST.archive = { @Sendable _, _, _, _ in throw RESTError.unreachable }
+      // No reload happens; if one did, it would throw — the row must come back regardless.
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in throw RESTError.unreachable }
+    }
+
+    await store.send(.confirmationDialog(.presented(.confirmArchive(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = [Session(id: "b")]
+      $0.archivingIDs = ["a"]
+    }
+    // The parent notification fires regardless of the PATCH outcome (the archive was confirmed).
+    await store.receive(\.delegate.sessionArchived)
+    // Failure restores the session at its original index (no reload), lifts the guard, sets error.
+    await store.receive(\.archiveFailed) {
+      $0.sessions = [session, Session(id: "b")]
+      $0.archivingIDs = []
+      $0.loadError = "Couldn’t archive the session."
+    }
+    await store.finish()
+    #expect(store.state.sessions.map(\.id) == ["a", "b"])
+  }
+
+  /// A fenced-write refusal (Hermes v0.22.1+) names its reason after the action's banner.
+  @Test func archiveRefusalAppendsTheReasonToTheBanner() async {
+    let session = Session(id: "a", title: "Keep me")
+    var initial = SessionListFeature.State(connection: connection, sessions: [session])
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Archive session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmArchive(id: "a")) { TextState("Archive") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.hermesREST.archive = { @Sendable _, _, _, _ in
+        throw RESTError.server(status: 409, detail: "session_busy")
+      }
+    }
+
+    await store.send(.confirmationDialog(.presented(.confirmArchive(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = []
+      $0.archivingIDs = ["a"]
+    }
+    await store.receive(\.delegate.sessionArchived)
+    await store.receive(\.archiveFailed) {
+      $0.sessions = [session]
+      $0.archivingIDs = []
+      $0.loadError = "Couldn’t archive the session. The session is busy. Try again when its turn ends."
+    }
+  }
+
+  @Test func archiveFailureRestoresPinAndSeenState() async {
+    let prefs = PreferencesClient.inMemory()
+    let session = Session(id: "a", title: "Keep me", messageCount: 5)
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [session, Session(id: "b")],
+      seenCounts: ["a": 3, "b": 2],
+      pinnedIDs: ["a"]
+    )
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Archive session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmArchive(id: "a")) { TextState("Archive") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.archive = { @Sendable _, _, _, _ in throw RESTError.unreachable }
+      // No reload happens; if one did it would throw — restore must be purely local.
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in throw RESTError.unreachable }
+    }
+
+    // Optimistic removal clears pin + seen and persists the cleared prefs.
+    await store.send(.confirmationDialog(.presented(.confirmArchive(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = [Session(id: "b")]
+      $0.pinnedIDs = []
+      $0.seenCounts = ["b": 2]
+      $0.archivingIDs = ["a"]
+    }
+    // The parent notification fires regardless of the PATCH outcome (the archive was confirmed).
+    await store.receive(\.delegate.sessionArchived)
+    // Failure restores the session + pin + seen baseline LOCALLY (no reload), persists them,
+    // lifts the guard, and sets the error.
+    await store.receive(\.archiveFailed) {
+      $0.sessions = [session, Session(id: "b")]
+      $0.pinnedIDs = ["a"]
+      $0.seenCounts = ["a": 3, "b": 2]
+      $0.archivingIDs = []
+      $0.loadError = "Couldn’t archive the session."
+    }
+    await store.finish()
+    // The restored prefs are persisted (not left as the cleared prefs).
+    #expect(prefs.loadPinnedIDs() == ["a"])
+    #expect(prefs.loadSeenCounts() == ["a": 3, "b": 2])
+  }
+
+  @Test func successResponseDuringArchiveIsFilteredButGuardIsTransient() async {
+    // A fetch that completes mid-PATCH (its response still carrying the archiving session)
+    // must be filtered WHILE the id is in flight. The guard is transient: archiveSucceeded
+    // clears it, so a LATER response would include the id again (no permanent filter).
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [Session(id: "b")],
+      isLoading: true,
+      seenCounts: ["b": 2]
+    )
+    initial.archivingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    // A stale response landing DURING the in-flight window still includes "a" (and "b"); only
+    // "b" survives, and "a" is NOT re-seeded into seenCounts (filtered before the seeding loop).
+    await store.send(.sessionsResponse(.success([Session(id: "a"), Session(id: "b")]))) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "b")] // "a" filtered out while in flight
+      $0.statusSessions = [Session(id: "b")]
+    }
+    #expect(store.state.seenCounts["a"] == nil)
+
+    // Success clears the transient guard (cancelling any in-flight fetch).
+    await store.send(.archiveSucceeded(id: "a")) {
+      $0.archivingIDs = []
+    }
+    #expect(store.state.archivingIDs.isEmpty)
+
+    // With the guard cleared, a LATER authoritative response is no longer filtered — there is
+    // no permanent filter (the server is the source of truth for archived state now).
+    await store.send(.sessionsResponse(.success([Session(id: "a"), Session(id: "b")]))) {
+      $0.sessions = [Session(id: "a"), Session(id: "b")]
+      $0.statusSessions = [Session(id: "a"), Session(id: "b")]
+      $0.seenCounts = ["a": 0, "b": 2]
+    }
+    #expect(store.state.sessions.map(\.id) == ["a", "b"])
+  }
+
+  // MARK: Deleting (mirrors archive: dialog → optimistic removal + rollback + guard)
+
+  @Test func deleteButtonPresentsConfirmationDialog() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, sessions: [Session(id: "a")])
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.deleteButtonTapped(id: "a")) {
+      $0.confirmationDialog = ConfirmationDialogState {
+        TextState("Delete session?")
+      } actions: {
+        ButtonState(role: .destructive, action: .confirmDelete(id: "a")) {
+          TextState("Delete")
+        }
+        ButtonState(role: .cancel) {
+          TextState("Cancel")
+        }
+      } message: {
+        TextState("This permanently deletes the session and its history.")
+      }
+    }
+    // Dismissing (cancel) clears the dialog and leaves the session in place.
+    await store.send(.confirmationDialog(.dismiss)) {
+      $0.confirmationDialog = nil
+    }
+    #expect(store.state.sessions.map(\.id) == ["a"])
+  }
+
+  @Test func confirmDeleteRemovesSessionOptimisticallyAndCallsRPC() async {
+    let prefs = PreferencesClient.inMemory()
+    let deleted = LockIsolated<[(String, String?)]>([])
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [Session(id: "a"), Session(id: "b")],
+      seenCounts: ["a": 1, "b": 2],
+      pinnedIDs: ["a"]
+    )
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Delete session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmDelete(id: "a")) { TextState("Delete") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesREST.deleteSession = { @Sendable _, id, profile in
+        deleted.withValue { $0.append((id, profile)) }
+      }
+    }
+
+    await store.send(.confirmationDialog(.presented(.confirmDelete(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = [Session(id: "b")]
+      $0.pinnedIDs = []
+      $0.seenCounts = ["b": 2]
+      $0.deletingIDs = ["a"] // in-flight guard while the DELETE runs
+    }
+    // The parent is told FIRST (it tears the live-chat slot down + wipes the cached snapshot).
+    await store.receive(\.delegate.sessionDeleted)
+    // Success clears the transient guard (so the poll resumes) and cancels any stale fetch.
+    await store.receive(\.deleteSucceeded) {
+      $0.deletingIDs = []
+    }
+    // Confirmation delegate — `AppFeature` drops the approval-badge entry on THIS one
+    // (not at initiation, so a failed delete keeps badging its still-pending approval).
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+    await store.finish()
+    #expect(store.state.deletingIDs.isEmpty)
+    #expect(deleted.value.count == 1)
+    #expect(deleted.value.first?.0 == "a")
+    #expect(deleted.value.first?.1 == nil) // no profiles API → no scoping
+    #expect(prefs.loadPinnedIDs() == [])
+    #expect(prefs.loadSeenCounts() == ["b": 2]) // deleted session's seen baseline persisted-cleared
+  }
+
+  @Test func deleteFailureRestoresSessionPinAndSeenStateAndSetsError() async {
+    // On failure the optimistic removal is reversed LOCALLY (no reliance on a reload): the
+    // session, its pin, and its seen baseline come back; the restored prefs are persisted.
+    let prefs = PreferencesClient.inMemory()
+    let session = Session(id: "a", title: "Keep me", messageCount: 5)
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [session, Session(id: "b")],
+      seenCounts: ["a": 3, "b": 2],
+      pinnedIDs: ["a"]
+    )
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Delete session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmDelete(id: "a")) { TextState("Delete") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in throw RESTError.unreachable }
+      // No reload happens; if one did it would throw — restore must be purely local.
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in throw RESTError.unreachable }
+    }
+
+    await store.send(.confirmationDialog(.presented(.confirmDelete(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = [Session(id: "b")]
+      $0.pinnedIDs = []
+      $0.seenCounts = ["b": 2]
+      $0.deletingIDs = ["a"]
+    }
+    // The parent notification fires regardless of the DELETE outcome (the delete was confirmed).
+    await store.receive(\.delegate.sessionDeleted)
+    // Failure restores the session + pin + seen baseline LOCALLY, persists them, lifts the
+    // guard, sets the banner — and the capability stays ON (a transient failure is no verdict).
+    await store.receive(\.deleteFailed) {
+      $0.sessions = [session, Session(id: "b")]
+      $0.pinnedIDs = ["a"]
+      $0.seenCounts = ["a": 3, "b": 2]
+      $0.deletingIDs = []
+      $0.loadError = "Couldn’t delete the session."
+    }
+    await store.finish()
+    #expect(store.state.deleteSupported)
+    #expect(prefs.loadPinnedIDs() == ["a"])
+    #expect(prefs.loadSeenCounts() == ["a": 3, "b": 2])
+  }
+
+  @Test(arguments: [RESTError.notFound, RESTError.server(status: 405, detail: nil)])
+  func deleteOnOlderAgentFlipsCapabilityOffSilently(error: RESTError) async {
+    // Older agents lack the DELETE route: a 404 — or a 405, since `/api/sessions/{id}`
+    // exists there for PATCH/GET — restores the row and flips `deleteSupported` off with
+    // NO banner (mirror the silent capability flips).
+    let session = Session(id: "a", title: "Keep me")
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [session, Session(id: "b")]
+    )
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Delete session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmDelete(id: "a")) { TextState("Delete") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in throw error }
+    }
+
+    await store.send(.confirmationDialog(.presented(.confirmDelete(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = [Session(id: "b")]
+      $0.deletingIDs = ["a"]
+    }
+    await store.receive(\.delegate.sessionDeleted)
+    await store.receive(\.deleteFailed) {
+      $0.sessions = [session, Session(id: "b")]
+      $0.deletingIDs = []
+      $0.deleteSupported = false // capability off — Delete affordances hide from here on
+      // NO loadError — the flip is silent.
+    }
+    await store.finish()
+    #expect(store.state.loadError == nil)
+    // With the capability off, a persisted `.delete` swipe pref clamps back to Archive.
+    #expect(store.state.effectiveSwipeAction == .archive)
+  }
+
+  @Test func successResponseDuringDeleteIsFilteredButGuardIsTransient() async {
+    // A fetch that completes mid-DELETE (its response still carrying the deleting session)
+    // must be filtered WHILE the id is in flight. The guard is transient: deleteSucceeded
+    // clears it, so a LATER response would include the id again (no permanent filter).
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [Session(id: "b")],
+      isLoading: true,
+      seenCounts: ["b": 2]
+    )
+    initial.deletingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    // A stale response landing DURING the in-flight window still includes "a" (and "b"); only
+    // "b" survives, and "a" is NOT re-seeded into seenCounts (filtered before the seeding loop).
+    await store.send(.sessionsResponse(.success([Session(id: "a"), Session(id: "b")]))) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "b")] // "a" filtered out while in flight
+      $0.statusSessions = [Session(id: "b")]
+    }
+    #expect(store.state.seenCounts["a"] == nil)
+
+    // Success clears the transient guard (cancelling any in-flight fetch).
+    await store.send(.deleteSucceeded(id: "a")) {
+      $0.deletingIDs = []
+    }
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+
+    // With the guard cleared, a LATER authoritative response is no longer filtered — the
+    // server is the source of truth (a genuinely deleted session just won't be in it).
+    await store.send(.sessionsResponse(.success([Session(id: "b")])))
+    #expect(store.state.sessions.map(\.id) == ["b"])
+  }
+
+  @Test func pollSkipsWhileDeleteInFlight() async {
+    let store = TestStore(
+      initialState: {
+        var state = SessionListFeature.State(connection: connection)
+        state.deletingIDs = ["a"]
+        return state
+      }()
+    ) {
+      SessionListFeature()
+    }
+
+    // No `.pulledToRefresh` is received — the poll skips while a DELETE is in flight
+    // (a reload could resurrect the optimistically-removed row).
+    await store.send(.pollTick)
+  }
+
+  @Test func deleteAffordancesAreNoOpsWhenUnsupported() async {
+    // The view hides Delete when the capability is off, but a context menu rendered
+    // before the flag flipped can still fire — the reducer refuses instead of
+    // round-tripping a doomed DELETE (mirrors the archived sheet's guard).
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a")]
+    )
+    initial.deleteSupported = false
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.deleteButtonTapped(id: "a")) // guard: no dialog raised
+
+    // And the confirm itself: the flag can flip (mirrored from the archived sheet) while
+    // a dialog is already up — no removal, no request.
+    var withDialog = initial
+    withDialog.confirmationDialog = ConfirmationDialogState {
+      TextState("Delete session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmDelete(id: "a")) { TextState("Delete") }
+    }
+    let confirmStore = TestStore(initialState: withDialog) { SessionListFeature() }
+    await confirmStore.send(.confirmationDialog(.presented(.confirmDelete(id: "a")))) {
+      $0.confirmationDialog = nil // the presentation machinery still dismisses
+    }
+    #expect(confirmStore.state.sessions[id: "a"] != nil) // row untouched
+  }
+
+  @Test func deleteFailureReinsertClampsWhenListShrankDuringFlight() async {
+    // If the list shrank while the DELETE was in flight (a refresh replaced `sessions`
+    // wholesale), the saved row/pin indices can exceed the current counts — the rollback
+    // must clamp both re-inserts, not crash or land out of bounds.
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a")] // shrank while "c" was deleting
+    )
+    initial.deletingIDs = ["c"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(.deleteFailed(
+      id: "c", session: Session(id: "c", title: "Tail"), index: 2, pinIndex: 3,
+      seenCount: 7, profileName: nil, searchQuery: "", error: .unreachable
+    )) {
+      $0.deletingIDs = []
+      // Saved index 2 > count 1 → row clamps to the end; pin index 3 > count 0 → front.
+      $0.sessions = [Session(id: "a"), Session(id: "c", title: "Tail")]
+      $0.pinnedIDs = ["c"]
+      $0.seenCounts = ["c": 7]
+      $0.loadError = "Couldn’t delete the session."
+    }
+  }
+
+  @Test func staleLoadAfterDeleteDoesNotResurrectSession() async {
+    // A list fetch already in flight (gated behind a continuation) when the user confirms
+    // a delete must NOT land afterward and re-add the just-removed row — `confirmDelete`
+    // cancels it, and `deleteFailed` (which follows here) deliberately does not restart it.
+    let prefs = PreferencesClient.inMemory()
+    let gate = AsyncStream.makeStream(of: Void.self)
+    var initial = SessionListFeature.State(
+      connection: connection,
+      sessions: [Session(id: "a"), Session(id: "b")]
+    )
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Delete session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmDelete(id: "a")) { TextState("Delete") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      $0.preferences = prefs
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in throw RESTError.unreachable }
+      // The cancelled load still runs its trailing cron fetch (the send is dropped) — stub
+      // it so the unimplemented-dependency check doesn't trip; no response is received.
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in
+        // Block until released, then return the OLD list (both sessions) — stale data.
+        var iterator = gate.stream.makeAsyncIterator()
+        await iterator.next()
+        return [Session(id: "a"), Session(id: "b")]
+      }
+    }
+
+    // Kick off a load that parks inside the fetch (the response can't land yet).
+    await store.send(.pulledToRefresh) {
+      $0.now = self.now
+      $0.isLoading = true
+    }
+
+    // Confirm the delete — this cancels the in-flight load and optimistically drops the row.
+    await store.send(.confirmationDialog(.presented(.confirmDelete(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = [Session(id: "b")]
+      $0.deletingIDs = ["a"]
+    }
+    await store.receive(\.delegate.sessionDeleted)
+    // The DELETE fails and rolls the row back locally — but the parked fetch stays
+    // cancelled: releasing it below must deliver NO `.sessionsResponse`.
+    await store.receive(\.deleteFailed) {
+      $0.deletingIDs = []
+      $0.sessions = [Session(id: "a"), Session(id: "b")]
+      $0.loadError = "Couldn’t delete the session."
+    }
+
+    gate.continuation.yield()
+    gate.continuation.finish()
+    await store.finish()
+    #expect(store.state.sessions.map(\.id) == ["a", "b"])
+  }
+
+  @Test func deleteSuccessRestartsAFetchStartedDuringTheWindow() async {
+    // A fetch started DURING the delete window (manual pull-to-refresh — the poll skips,
+    // but the user can still pull) is only defended by the `deletingIDs` filter while the
+    // guard is up. `deleteSucceeded` lifts the guard, so it must supersede that fetch —
+    // its stale response landing afterwards would resurrect the deleted row — but NOT
+    // with a bare cancel, which would strand `isLoading` until the next poll. It RESTARTS
+    // the fetch: the parked stale one is cancelled and a fresh post-delete response lands.
+    let calls = LockIsolated(0)
+    var initial = SessionListFeature.State(connection: connection)
+    initial.deletingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in
+        // First call (the mid-window refresh) parks forever — stale, its response must
+        // never land. Second call (the restart) returns the authoritative list.
+        if calls.withValue({ $0 += 1; return $0 }) == 1 { try await Task.never() }
+        return [Session(id: "b")]
+      }
+    }
+
+    await store.send(.pulledToRefresh) {
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.send(.deleteSucceeded(id: "a")) {
+      $0.deletingIDs = []
+    }
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+    // The restarted fetch delivers fresh data — the spinner clears, nothing is stranded.
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "b")]
+      $0.statusSessions = [Session(id: "b")]
+      $0.seenCounts = ["b": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    await store.finish()
+  }
+
+  @Test func deleteSuccessDuringSearchRefreshesTheSearchResults() async {
+    // While searching the poll is PAUSED — a bare fetch-cancel on delete success would
+    // leave stale search results (and a possibly stuck spinner) on screen indefinitely.
+    // Success during an active search re-runs the search instead: authoritative,
+    // post-delete results replace the list.
+    let searched = LockIsolated<[String]>([])
+    var initial = SessionListFeature.State(connection: connection, searchQuery: "plan")
+    initial.sessions = [Session(id: "b")]
+    initial.deletingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.hermesREST.search = { @Sendable _, query, _ in
+        searched.withValue { $0.append(query) }
+        return [Session(id: "b")]
+      }
+    }
+
+    await store.send(.deleteSucceeded(id: "a")) {
+      $0.now = self.now
+      $0.deletingIDs = []
+      $0.isLoading = true // the restarted search fetch is on its way
+    }
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.seenCounts = ["b": 0]
+    }
+    await store.finish()
+    #expect(searched.value == ["plan"]) // the ACTIVE query re-ran, not a plain list load
+  }
+
+  @Test func deleteFailureAfterProfileSwitchDoesNotReinsertIntoTheNewProfilesList() async {
+    // The DELETE was issued under "work"; by the time it fails the user has switched to
+    // the default profile. Re-inserting the captured session would put a cross-profile
+    // row in the new list — opening it would resume under the wrong scope — so the ROW
+    // re-insert is dropped (the old profile's list re-fetches the still-existing row on
+    // return). The pin/seen metadata is device-GLOBAL (keyed by session id, not
+    // profile-scoped) though, so it IS restored and persisted — the server kept the
+    // session, and skipping it would lose the pin/unread baseline for good. The failure
+    // itself is still surfaced.
+    let prefs = PreferencesClient.inMemory()
+    var initial = SessionListFeature.State(connection: connection)
+    initial.profilesSupported = true
+    initial.selectedProfileName = SessionListFeature.State.defaultProfileName
+    initial.sessions = [Session(id: "d1")] // the default profile's list
+    initial.deletingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+    }
+
+    await store.send(.deleteFailed(
+      id: "a", session: Session(id: "a", title: "Work row"), index: 0, pinIndex: 0,
+      seenCount: 4, profileName: "work", searchQuery: "", error: .unreachable
+    )) {
+      $0.deletingIDs = []
+      $0.loadError = "Couldn’t delete the session."
+      // No row re-insert — but the global pin/seen metadata comes back (and persists).
+      $0.pinnedIDs = ["a"]
+      $0.seenCounts = ["a": 4]
+    }
+    #expect(store.state.sessions.map(\.id) == ["d1"])
+    #expect(prefs.loadPinnedIDs() == ["a"])
+    #expect(prefs.loadSeenCounts() == ["a": 4])
+  }
+
+  @Test func deleteVerdictAfterProfileSwitchStillFlipsCapability() async {
+    // Same mid-flight profile switch, but the failure is the 404/405 capability verdict:
+    // the flag is SERVER-wide, so it still flips (silently) even though the rollback is
+    // dropped for the changed context.
+    var initial = SessionListFeature.State(connection: connection)
+    initial.profilesSupported = true
+    initial.sessions = [Session(id: "d1")]
+    initial.deletingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(.deleteFailed(
+      id: "a", session: Session(id: "a"), index: 0, pinIndex: nil,
+      seenCount: nil, profileName: "work", searchQuery: "", error: .notFound
+    )) {
+      $0.deletingIDs = []
+      $0.deleteSupported = false // verdict applies; no banner, no re-insert
+    }
+    #expect(store.state.loadError == nil)
+    #expect(store.state.sessions.map(\.id) == ["d1"])
+  }
+
+  @Test func archiveFailureAfterProfileSwitchDoesNotReinsertIntoTheNewProfilesList() async {
+    // The archive rollback mirrors the delete guard: a PATCH issued under "work" that
+    // fails after a switch to the default profile must not re-insert the old profile's
+    // row into the new list.
+    var initial = SessionListFeature.State(connection: connection)
+    initial.profilesSupported = true
+    initial.sessions = [Session(id: "d1")]
+    initial.archivingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(.archiveFailed(
+      id: "a", session: Session(id: "a", title: "Work row"), index: 0, pinIndex: nil,
+      seenCount: nil, profileName: "work", searchQuery: "", error: .unreachable
+    )) {
+      $0.archivingIDs = []
+      $0.loadError = "Couldn’t archive the session."
+    }
+    #expect(store.state.sessions.map(\.id) == ["d1"])
+  }
+
+  @Test func deleteFailureAfterSearchChangeDoesNotReinsertIntoTheNewQuerysResults() async {
+    // The DELETE was issued from the "old" query's results; by the time it fails the
+    // user is searching "new". The poll is PAUSED while searching, so re-inserting the
+    // captured row would park a wrong-query result on screen with nothing to reconcile
+    // it — the row re-insert is dropped (same context rule as the profile switch), while
+    // the device-global pin/seen metadata is still restored and persisted.
+    let prefs = PreferencesClient.inMemory()
+    var initial = SessionListFeature.State(connection: connection, searchQuery: "new")
+    initial.sessions = [Session(id: "n1")] // the new query's results
+    initial.deletingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+    }
+
+    await store.send(.deleteFailed(
+      id: "a", session: Session(id: "a", title: "Old result"), index: 0, pinIndex: 0,
+      seenCount: 4, profileName: nil, searchQuery: "old", error: .unreachable
+    )) {
+      $0.deletingIDs = []
+      $0.loadError = "Couldn’t delete the session."
+      $0.pinnedIDs = ["a"]
+      $0.seenCounts = ["a": 4]
+    }
+    #expect(store.state.sessions.map(\.id) == ["n1"])
+    #expect(prefs.loadPinnedIDs() == ["a"])
+  }
+
+  @Test func archiveFailureAfterSearchChangeDoesNotReinsertIntoTheNewQuerysResults() async {
+    // The archive rollback shares the delete's context rule: a PATCH issued from one
+    // query's results must not re-insert its row into a different query's results.
+    var initial = SessionListFeature.State(connection: connection, searchQuery: "new")
+    initial.sessions = [Session(id: "n1")]
+    initial.archivingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(.archiveFailed(
+      id: "a", session: Session(id: "a", title: "Old result"), index: 0, pinIndex: nil,
+      seenCount: nil, profileName: nil, searchQuery: "old", error: .unreachable
+    )) {
+      $0.archivingIDs = []
+      $0.loadError = "Couldn’t archive the session."
+    }
+    #expect(store.state.sessions.map(\.id) == ["n1"])
+  }
+
+  @Test func clearingTheSearchReloadsTheListImmediately() async {
+    // Clearing the query must NOT go through the 300ms search debounce: it reloads via
+    // `load`, which raises `isLoading` — the flag `cancelOrRestartFetch` keys on. The
+    // debounced search effect raises nothing, and with the query already empty
+    // `isSearching` is false too, so a mutation success landing in a debounced window
+    // would bare-cancel the pending reload and strand the stale search results.
+    var initial = SessionListFeature.State(connection: connection, searchQuery: "foo")
+    initial.sessions = [Session(id: "stale-result")]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.continuousClock = TestClock() // never advanced — proves there is no debounce
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [Session(id: "fresh")] }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+    }
+
+    await store.send(\.binding.searchQuery, "") {
+      $0.searchQuery = ""
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "fresh")]
+      $0.statusSessions = [Session(id: "fresh")]
+      $0.seenCounts = ["fresh": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+  }
+
+  @Test func archiveSuccessAfterClearingSearchRestartsThePendingReload() async {
+    // An archive is in flight from search results and the user clears the search during
+    // the RPC window: the pending reload (raised by the cleared binding) is only visible
+    // through `isLoading` — `isSearching` is already false. Success must RESTART it, not
+    // bare-cancel it: a cancel would leave the old search results on screen until the
+    // next poll.
+    let calls = LockIsolated(0)
+    var initial = SessionListFeature.State(connection: connection, searchQuery: "foo")
+    initial.sessions = [Session(id: "stale-result")]
+    initial.archivingIDs = ["x"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in
+        // The cleared-search reload parks (a pre-archive response that must never
+        // land); the restart returns the authoritative post-archive list.
+        if calls.withValue({ $0 += 1; return $0 }) == 1 { try await Task.never() }
+        return [Session(id: "fresh")]
+      }
+    }
+
+    await store.send(\.binding.searchQuery, "") {
+      $0.searchQuery = ""
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.send(.archiveSucceeded(id: "x")) {
+      $0.archivingIDs = []
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "fresh")]
+      $0.statusSessions = [Session(id: "fresh")]
+      $0.seenCounts = ["fresh": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    await store.finish()
+  }
+
+  @Test func effectiveSwipeActionClampsToArchiveWhenDeleteUnsupported() {
+    var state = SessionListFeature.State(connection: connection)
+    state.defaultSwipeAction = .delete
+    #expect(state.effectiveSwipeAction == .delete) // supported → the pref rules
+
+    state.deleteSupported = false
+    #expect(state.effectiveSwipeAction == .archive) // unsupported → clamped, pref untouched
+    #expect(state.defaultSwipeAction == .delete)
+  }
+
+  @Test func loadSeedsDefaultSwipeActionFromPreferences() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.saveDefaultSessionSwipeAction(.delete)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [] }
+    }
+
+    await store.send(.pulledToRefresh) {
+      $0.now = self.now
+      $0.isLoading = true
+      $0.defaultSwipeAction = .delete // seeded from prefs with the other pref reloads
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = []
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.isLoading = false
+      $0.cronJobsSupported = false
+    }
+  }
+
+  // MARK: Rename (optimistic + rollback, mirroring archive)
+
+  @Test func renameOptimisticallyUpdatesTitleAndCallsRPC() async {
+    let renamed = LockIsolated<[(String, String)]>([])
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "a", title: "Old"), Session(id: "b")]
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.rename = { @Sendable _, id, title, _ in
+        renamed.withValue { $0.append((id, title)) }
+      }
+    }
+
+    // Tapping rename seeds the draft with the row's current title and opens the alert.
+    await store.send(.renameButtonTapped(id: "a")) {
+      $0.renamingID = "a"
+      $0.renameDraft = "Old"
+    }
+
+    // Edit the draft (pure binding, no side effect).
+    await store.send(\.binding.renameDraft, "New name") {
+      $0.renameDraft = "New name"
+    }
+
+    // Confirm optimistically updates the title, clears the alert, marks in-flight, and fires the RPC.
+    await store.send(.confirmRename) {
+      $0.sessions[id: "a"]?.title = "New name"
+      $0.renamingID = nil
+      $0.renameDraft = ""
+      $0.renamingInFlightIDs = ["a"]
+    }
+    await store.receive(\.renameSucceeded) {
+      $0.renamingInFlightIDs = [] // guard lifted, poll resumes
+    }
+    #expect(renamed.value.count == 1)
+    #expect(renamed.value.first?.0 == "a")
+    #expect(renamed.value.first?.1 == "New name")
+  }
+
+  @Test func pollResumesAfterSuccessfulRename() async {
+    // The rename guard is transient: once renameSucceeded clears it, a pollTick (not searching,
+    // renamingInFlightIDs empty) DOES refresh — and renameSucceeded cancels any fetch started
+    // during the PATCH window so a stale response can't clobber the optimistic title.
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection, renamingInFlightIDs: ["a"]
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [] }
+    }
+
+    // While the rename is in flight, the poll skips (guard non-empty).
+    await store.send(.pollTick)
+
+    // Success clears the transient guard (and cancels any in-flight fetch).
+    await store.send(.renameSucceeded(id: "a")) {
+      $0.renamingInFlightIDs = []
+    }
+
+    // Now a poll tick refreshes again — the poll was only paused, not killed.
+    await store.send(.pollTick)
+    await store.receive(\.pulledToRefresh) {
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = []
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.isLoading = false
+      $0.cronJobsSupported = false
+    }
+  }
+
+  @Test func renameFailureRestoresPreviousTitleAndSetsError() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "a", title: "Keep me")],
+        renamingID: "a",
+        renameDraft: "Too long"
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.rename = { @Sendable _, _, _, _ in throw RESTError.server(status: 400) }
+    }
+
+    // Optimistic update, then the RPC throws → renameFailed restores the previous title.
+    await store.send(.confirmRename) {
+      $0.sessions[id: "a"]?.title = "Too long"
+      $0.renamingID = nil
+      $0.renameDraft = ""
+      $0.renamingInFlightIDs = ["a"]
+    }
+    await store.receive(\.renameFailed) {
+      $0.renamingInFlightIDs = [] // guard lifted on failure too
+      $0.sessions[id: "a"]?.title = "Keep me"
+      $0.loadError = "Couldn’t rename the session."
+    }
+  }
+
+  @Test func pollTickIsSkippedWhileRenameInFlight() async {
+    // While a rename PATCH is in flight a pollTick must not fetch — a fetch landing mid-PATCH
+    // would clobber the optimistic title with the server's old one.
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "a", title: "New name")],
+        renamingInFlightIDs: ["a"]
+      )
+    ) {
+      SessionListFeature()
+    }
+    // No .pulledToRefresh / fetch follows — the guard short-circuits the tick.
+    await store.send(.pollTick)
+  }
+
+  @Test func cancelRenameDismissesAlertWithoutChange() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "a", title: "Old")],
+        renamingID: "a",
+        renameDraft: "Edited"
+      )
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.cancelRename) {
+      $0.renamingID = nil
+      $0.renameDraft = ""
+    }
+    #expect(store.state.sessions[id: "a"]?.title == "Old")
+  }
+
+  @Test func newSessionButtonEmitsCreateDelegate() async {
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    }
+
+    await store.send(.newSessionButtonTapped)
+    await store.receive(\.delegate.createSession)
+  }
+
+  // MARK: Push onboarding (plugin readiness + permission + the inline card + snooze)
+
+  /// A `PushClient` that reports `status` without prompting and counts the reads and the
+  /// system prompts, so a test can prove the prompt never fires before the Turn on tap.
+  private func spyPush(
+    status: PushAuthorizationStatus,
+    statusReads: LockIsolated<Int>,
+    prompts: LockIsolated<Int>
+  ) -> PushClient {
+    var client = PushClient.testValue
+    client.authorizationStatus = {
+      statusReads.withValue { $0 += 1 }
+      return status
+    }
+    client.requestAuthorization = {
+      prompts.withValue { $0 += 1 }
+      return status == .authorized || status == .provisional
+    }
+    return client
+  }
+
+  /// Every `(plugin status × authorization status × snoozed)` combination of the setup verdict.
+  /// The permission is only READ (never requested) on list appearance; a ready plugin with
+  /// permission already granted registers silently, with no card.
+  @Test(
+    arguments: [PushPluginStatus.ready, .notReady, .unknown],
+    [PushAuthorizationStatus.notDetermined, .denied, .authorized, .provisional]
+  )
+  func setupPushVerdictMatrix(
+    plugin: PushPluginStatus,
+    authorization: PushAuthorizationStatus
+  ) async {
+    for snoozed in [false, true] {
+      let statusReads = LockIsolated(0)
+      let prompts = LockIsolated(0)
+      let prefs = PreferencesClient.inMemory()
+      let snoozeUntil = now.addingTimeInterval(86_400)
+      if snoozed { prefs.savePushPromptSnooze(1, snoozeUntil) }
+      let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+        SessionListFeature()
+      } withDependencies: {
+        $0.date = .constant(now)
+        $0.preferences = prefs
+        $0.push = spyPush(status: authorization, statusReads: statusReads, prompts: prompts)
+        $0.hermesREST.pushPluginStatus = { @Sendable _ in plugin }
+      }
+
+      await store.send(.setupPush)
+      switch plugin {
+      case .ready:
+        await store.receive(\.pushPluginStatusLoaded)
+        if authorization == .notDetermined, !snoozed {
+          await store.receive(\.pushAuthorizationStatusLoaded) {
+            $0.pushCard = .enableNotifications
+          }
+        } else {
+          await store.receive(\.pushAuthorizationStatusLoaded) // no card
+        }
+        if authorization == .authorized || authorization == .provisional {
+          // Silent register: `requestAuthorization` resolves without a prompt when already
+          // granted, and a granted verdict clears the snooze.
+          await store.receive(\.requestPushAuthorization)
+          await store.finish()
+          #expect(prompts.value == 1)
+          #expect(prefs.loadPushPromptSnooze() == nil)
+        } else {
+          #expect(prompts.value == 0)
+          #expect(prefs.loadPushPromptSnooze()?.until == (snoozed ? snoozeUntil : nil))
+        }
+        #expect(statusReads.value == 1)
+      case .notReady:
+        await store.receive(\.pushPluginStatusLoaded) {
+          $0.pushAvailable = false
+          if !snoozed { $0.pushCard = .installPlugin }
+        }
+        #expect(statusReads.value == 0)
+        #expect(prompts.value == 0)
+      case .unknown:
+        await store.receive(\.pushPluginStatusLoaded) // can't tell → no card, no change
+        #expect(statusReads.value == 0)
+        #expect(prompts.value == 0)
+      }
+      await store.finish()
+    }
+  }
+
+  /// The card renders only on the Sessions tab with no query; a search hides it.
+  @Test func pushCardIsHiddenWhileSearchingAndOnTheCronTab() {
+    var state = SessionListFeature.State(connection: connection)
+    #expect(!state.showsPushCard) // no verdict yet
+    state.pushCard = .enableNotifications
+    #expect(state.showsPushCard)
+    state.isSearchPresented = true
+    #expect(state.showsPushCard) // an open, empty search field still shows the list body
+    state.searchQuery = "parser"
+    #expect(!state.showsPushCard)
+    state.searchQuery = ""
+    state.isSearchPresented = false
+    state.cronJobs = [CronJob(id: "j1", name: "Nightly")]
+    state.selectedTab = .cron
+    #expect(!state.showsPushCard)
+  }
+
+  @Test func setupPushReadyAndAuthorizedRegistersSilently() async {
+    let push = PushClient.inMemory(granted: true, status: .authorized)
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePushPromptSnooze(2, now.addingTimeInterval(86_400)) // a stale snooze to be cleared
+    let registered = LockIsolated<String?>(nil)
+    var initial = SessionListFeature.State(connection: connection)
+    initial.pushAvailable = false
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.push = push.client
+      $0.preferences = prefs
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .ready }
+      $0.hermesREST.registerPush = { @Sendable _, token, _, _ in registered.setValue(token) }
+    }
+
+    await store.send(.setupPush)
+    await store.receive(\.pushPluginStatusLoaded) {
+      $0.pushAvailable = true // ready → push available
+    }
+    await store.receive(\.pushAuthorizationStatusLoaded)
+    #expect(prefs.loadPushPromptSnooze() == nil) // snooze cleared once granted
+    await store.receive(\.requestPushAuthorization)
+    push.emit(token: "deadbeef")
+    await store.receive(\.pushTokenReceived)
+    await store.receive(\.pushRegistered)
+    #expect(registered.value == "deadbeef")
+    await store.send(.onDisappear)
+  }
+
+  /// A ready probe replaces a stale install card from an earlier `notReady` verdict.
+  @Test func setupPushReadyReplacesAStaleInstallCard() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.pushAvailable = false
+    initial.pushCard = .installPlugin
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.push.authorizationStatus = { .notDetermined }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .ready }
+    }
+
+    await store.send(.setupPush)
+    await store.receive(\.pushPluginStatusLoaded) {
+      $0.pushAvailable = true
+      $0.pushCard = nil
+    }
+    await store.receive(\.pushAuthorizationStatusLoaded) {
+      $0.pushCard = .enableNotifications
+    }
+  }
+
+  /// Every pop back to the list re-runs `setupPush`; a Turn on card already showing stays put
+  /// through the ready probe instead of being removed and re-inserted a beat later.
+  @Test func setupPushReadyKeepsAShowingTurnOnCard() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.pushAvailable = true
+    initial.pushCard = .enableNotifications
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.push.authorizationStatus = { .notDetermined }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .ready }
+    }
+
+    await store.send(.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.pushAuthorizationStatusLoaded)
+  }
+
+  /// An elapsed snooze no longer hides the card.
+  @Test func setupPushShowsTheCardOnceTheSnoozeElapses() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePushPromptSnooze(3, now.addingTimeInterval(-1))
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .notReady }
+    }
+
+    await store.send(.setupPush)
+    await store.receive(\.pushPluginStatusLoaded) {
+      $0.pushAvailable = false
+      $0.pushCard = .installPlugin
+    }
+  }
+
+  /// The system prompt fires only from the card's Turn on: the card goes away, permission is
+  /// requested, and a grant registers the device token.
+  @Test func pushCardEnableRequestsAuthorizationAndRegisters() async {
+    let push = PushClient.inMemory(granted: true, status: .notDetermined)
+    let registered = LockIsolated<String?>(nil)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.push = push.client
+      $0.preferences = .inMemory()
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .ready }
+      $0.hermesREST.registerPush = { @Sendable _, token, _, _ in registered.setValue(token) }
+    }
+
+    await store.send(.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.pushAuthorizationStatusLoaded) {
+      $0.pushCard = .enableNotifications
+    }
+    await store.send(.pushCardEnableButtonTapped) {
+      $0.pushCard = nil
+    }
+    await store.receive(\.requestPushAuthorization)
+    push.emit(token: "deadbeef")
+    await store.receive(\.pushTokenReceived)
+    await store.receive(\.pushRegistered)
+    #expect(registered.value == "deadbeef")
+    await store.send(.onDisappear)
+  }
+
+  /// Turn on → Don't Allow: no register, and the next appearance shows no card (denied).
+  @Test func pushCardEnableDeniedShowsNoCardNextTime() async {
+    let prompts = LockIsolated(0)
+    let statusReads = LockIsolated(0)
+    let status = LockIsolated(PushAuthorizationStatus.notDetermined)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = .inMemory()
+      $0.push.authorizationStatus = {
+        statusReads.withValue { $0 += 1 }
+        return status.value
+      }
+      $0.push.requestAuthorization = {
+        prompts.withValue { $0 += 1 }
+        status.setValue(.denied)
+        return false
+      }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .ready }
+    }
+
+    await store.send(.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.pushAuthorizationStatusLoaded) {
+      $0.pushCard = .enableNotifications
+    }
+    #expect(prompts.value == 0) // nothing asked before the tap
+    await store.send(.pushCardEnableButtonTapped) {
+      $0.pushCard = nil
+    }
+    await store.receive(\.requestPushAuthorization)
+    await store.finish()
+    #expect(prompts.value == 1)
+
+    await store.send(.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.pushAuthorizationStatusLoaded) // denied → no card
+    #expect(statusReads.value == 2)
+    #expect(prompts.value == 1)
+  }
+
+  @Test(arguments: [SessionListFeature.PushCard.enableNotifications, .installPlugin])
+  func pushCardNotNowSnoozesOneDayOnFirstTap(card: SessionListFeature.PushCard) async {
+    let prefs = PreferencesClient.inMemory()
+    var initial = SessionListFeature.State(connection: connection)
+    initial.pushCard = card
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+    }
+
+    // First "Not now" / "Later" → count 1 → 1 day.
+    await store.send(.pushCardNotNowButtonTapped) {
+      $0.pushCard = nil
+    }
+    let snooze = prefs.loadPushPromptSnooze()
+    #expect(snooze?.count == 1)
+    #expect(snooze?.until == now.addingTimeInterval(1 * 86_400))
+  }
+
+  @Test func pushCardNotNowIncrementsCountAndUsesNextFibonacciInterval() async {
+    // Two prior snoozes — the next bumps to count 3 → 3 days out.
+    let prefs = PreferencesClient.inMemory()
+    prefs.savePushPromptSnooze(2, now.addingTimeInterval(-1)) // already elapsed
+    var initial = SessionListFeature.State(connection: connection)
+    initial.pushCard = .enableNotifications
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+    }
+
+    await store.send(.pushCardNotNowButtonTapped) {
+      $0.pushCard = nil
+    }
+    let snooze = prefs.loadPushPromptSnooze()
+    #expect(snooze?.count == 3)
+    #expect(snooze?.until == now.addingTimeInterval(3 * 86_400))
+  }
+
+  /// The snooze written by Not now hides the card on the next appearance.
+  @Test func pushCardNotNowHidesTheCardOnTheNextAppearance() async {
+    let prefs = PreferencesClient.inMemory()
+    var initial = SessionListFeature.State(connection: connection)
+    initial.pushCard = .installPlugin
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .notReady }
+    }
+
+    await store.send(.pushCardNotNowButtonTapped) {
+      $0.pushCard = nil
+    }
+    await store.send(.setupPush)
+    await store.receive(\.pushPluginStatusLoaded) {
+      $0.pushAvailable = false // snoozed → still no card
+    }
+  }
+
+  @Test func pushCardAskAgentOpensPrefilledChat() async {
+    let prefs = PreferencesClient.inMemory()
+    var initial = SessionListFeature.State(connection: connection)
+    initial.pushCard = .installPlugin
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+    }
+
+    await store.send(.pushCardAskAgentButtonTapped) {
+      $0.pushCard = nil
+    }
+    // The create delegate carries the install prompt, pre-filled but not sent.
+    await store.receive(\.delegate.createSession, PushSetup.installPrompt)
+    #expect(prefs.loadPushPromptSnooze() == nil) // asking the agent is not a snooze
+  }
+
+  @Test func settingsInstallPushPluginOpensPrefilledChat() async {
+    var initial = SessionListFeature.State(connection: connection, selectedTab: .settings)
+    initial.settings = SettingsFeature.State(connection: connection)
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.settings(.presented(.delegate(.installPushPlugin)))) {
+      $0.settings = nil
+      $0.selectedTab = .sessions
+    }
+    await store.receive(\.delegate.createSession)
+  }
+
+  // MARK: Settings tab
+
+  /// Selecting the Settings tab seeds its state; re-tapping it keeps that state (and any
+  /// pushed sub-screen); leaving for another tab drops it, cancelling its effects.
+  @Test func settingsTabSeedsOnSelectAndDropsOnLeave() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, cronJobs: [CronJob(id: "job1")])
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.selectTab(.settings)) {
+      $0.selectedTab = .settings
+      $0.settings = SettingsFeature.State(connection: self.connection)
+    }
+    #expect(store.state.effectiveTab == .settings)
+
+    await store.send(.settings(.presented(.acknowledgementsRowTapped))) {
+      $0.settings?.path.append(.acknowledgements(AcknowledgementsFeature.State()))
+    }
+    await store.send(.selectTab(.settings)) // re-tap: no reseed, the sub-screen survives
+
+    await store.send(.selectTab(.cron)) {
+      $0.selectedTab = .cron
+      $0.settings = nil
+    }
+    #expect(store.state.effectiveTab == .cron)
+  }
+
+  /// A child `dismiss()` (Reconnect, Sign out, "Ask agent") closes the tab back to Sessions.
+  @Test func settingsChildDismissFallsBackToSessions() async {
+    var initial = SessionListFeature.State(connection: connection, selectedTab: .settings)
+    initial.settings = SettingsFeature.State(connection: connection)
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.settings(.dismiss)) {
+      $0.settings = nil
+      $0.selectedTab = .sessions
+    }
+    #expect(store.state.effectiveTab == .sessions)
+  }
+
+  /// An App Intent dismissing the list's presentations does NOT touch the Settings tab: that
+  /// nil-out would run in `AppFeature`, outside the list's `ifLet`, orphaning Settings'
+  /// effects. (Compact leaves the tab through `AppFeature`'s path rule instead.)
+  @Test func dismissPresentationsKeepsTheSettingsTab() {
+    var state = SessionListFeature.State(connection: connection, selectedTab: .settings)
+    state.settings = SettingsFeature.State(connection: connection)
+    state.archived = ArchivedSessionsFeature.State(connection: connection)
+    state.dismissPresentations()
+    #expect(state.archived == nil)
+    #expect(state.settings != nil)
+    #expect(state.effectiveTab == .settings)
+  }
+
+  /// Leaving the tab drops Settings' state through the list's `ifLet`, so its in-flight
+  /// effects (here the `.task` status probe, parked forever) are cancelled, not orphaned.
+  @Test func leavingTheSettingsTabCancelsItsEffects() async {
+    let probeCancelled = LockIsolated(false)
+    var initial = SessionListFeature.State(connection: connection, selectedTab: .settings)
+    initial.settings = SettingsFeature.State(connection: connection)
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.status = { @Sendable _ in
+        do {
+          try await Task.never()
+        } catch {
+          probeCancelled.setValue(true)
+          throw error
+        }
+        return ServerStatus()
+      }
+      $0.hermesREST.pushPluginInfo = { @Sendable _ in PushPluginInfo(status: .unknown) }
+      $0.push = PushClient.inMemory(granted: false, status: .notDetermined).client
+    }
+    store.exhaustivity = .off(showSkippedAssertions: false)
+
+    await store.send(.settings(.presented(.task)))
+    await store.send(.selectTab(.sessions)) {
+      $0.settings = nil
+      $0.selectedTab = .sessions
+    }
+    await store.finish()
+    #expect(probeCancelled.value)
+  }
+
+  /// An open Settings tab follows the list's seed facts: a renamed (or re-homed) profile, a
+  /// delete-capability verdict and a push verdict all reach it.
+  @Test func openSettingsTabMirrorsTheListsSeedFacts() async {
+    var initial = SessionListFeature.State(
+      connection: connection,
+      selectedTab: .settings,
+      profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+      selectedProfileName: "work",
+      profilesSupported: true
+    )
+    initial.settings = SettingsFeature.State(connection: connection, profileName: "work")
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesProfiles.rename = { @Sendable _, _, _ in }
+    }
+
+    // The trailing sync runs in the SAME action that moved the list's scope.
+    await store.send(.renameProfileButtonTapped(name: "work", newName: "job")) {
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "job")]
+      $0.selectedProfileName = "job"
+      $0.settings?.profileName = "job"
+    }
+    await store.receive(\.renameProfileSucceeded)
+
+    var flipped = store.state
+    flipped.deleteSupported = false
+    flipped.pushAvailable = false
+    flipped.syncSettingsSeed()
+    #expect(flipped.settings?.deleteSupported == false)
+    #expect(flipped.settings?.pushAvailable == false)
+
+    // Closed tab: nothing to mirror.
+    var closed = SessionListFeature.State(connection: connection)
+    closed.syncSettingsSeed()
+    #expect(closed.settings == nil)
+  }
+
+  /// The Settings tab renders only with seeded state, and never while searching.
+  @Test func settingsTabRendersOnlyWithStateOutsideSearch() {
+    var state = SessionListFeature.State(connection: connection, selectedTab: .settings)
+    #expect(state.effectiveTab == .sessions, "no seeded state: nothing to render")
+    state.settings = SettingsFeature.State(connection: connection)
+    #expect(state.effectiveTab == .settings)
+    state.isSearchPresented = true
+    #expect(state.effectiveTab == .sessions)
+  }
+
+  @Test func settingsPresentationThreadsPushAvailability() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.pushAvailable = false // a 404 earlier flipped push off
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.selectTab(.settings)) {
+      $0.selectedTab = .settings
+      $0.settings = SettingsFeature.State(connection: self.connection, pushAvailable: false)
+    }
+  }
+
+  @Test func settingsPresentationThreadsSwipeActionAndDeleteSupport() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.defaultSwipeAction = .delete
+    initial.deleteSupported = false // an earlier 404/405 flipped delete off
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.selectTab(.settings)) {
+      $0.selectedTab = .settings
+      $0.settings = SettingsFeature.State(
+        connection: self.connection, defaultSwipeAction: .delete, deleteSupported: false
+      )
+    }
+  }
+
+  /// With the profiles API, Settings gets the literal wire profile (`scopedProfileName`) for
+  /// its Profile row; without it the row is hidden (`nil`).
+  @Test func settingsPresentationThreadsScopedProfileName() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.profilesSupported = true
+    initial.selectedProfileName = "work"
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.selectTab(.settings)) {
+      $0.selectedTab = .settings
+      $0.settings = SettingsFeature.State(connection: self.connection, profileName: "work")
+    }
+
+    // Profiles unsupported → no Profile row, whatever the stored selection says.
+    var unsupported = SessionListFeature.State(connection: connection)
+    unsupported.profilesSupported = false
+    unsupported.selectedProfileName = "work"
+    let unsupportedStore = TestStore(initialState: unsupported) { SessionListFeature() }
+
+    await unsupportedStore.send(.selectTab(.settings)) {
+      $0.selectedTab = .settings
+      $0.settings = SettingsFeature.State(connection: self.connection)
+    }
+    #expect(unsupportedStore.state.settings?.profileName == nil)
+  }
+
+  /// A gated session reaches Settings through `connection` — the Auth row and token-field
+  /// gate read it there.
+  @Test func settingsPresentationCarriesTheAuthSession() async {
+    let cookieConnection = ServerConnection(
+      baseURL: connection.baseURL,
+      auth: .cookie(CookieSession(cookies: [], username: "alice", provider: "basic"))
+    )
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: cookieConnection)
+    ) { SessionListFeature() }
+
+    await store.send(.selectTab(.settings)) {
+      $0.selectedTab = .settings
+      $0.settings = SettingsFeature.State(connection: cookieConnection)
+    }
+    #expect(store.state.settings?.authLabel == "Password · alice")
+    #expect(store.state.settings?.showsTokenField == false)
+  }
+
+  @Test func settingsSwipeActionDelegateUpdatesTheList() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.settings = SettingsFeature.State(connection: connection)
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    // Settings already persisted the pref; the list mirrors it in-memory immediately.
+    await store.send(.settings(.presented(.delegate(.defaultSwipeActionChanged(.delete))))) {
+      $0.defaultSwipeAction = .delete
+    }
+  }
+
+  /// Settings opens on the persisted Live Activity toggles (#138).
+  @Test func settingsPresentationSeedsTheLiveActivityToggles() async {
+    let preferences = PreferencesClient.inMemory()
+    preferences.saveLiveActivityEnabled(true)
+    preferences.saveLiveActivityShowsTitles(false)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = preferences
+    }
+
+    await store.send(.selectTab(.settings)) {
+      $0.selectedTab = .settings
+      $0.settings = SettingsFeature.State(
+        connection: self.connection, liveActivityEnabled: true, liveActivityShowsTitles: false
+      )
+    }
+
+    preferences.saveLiveActivityEnabled(false)
+    await store.send(.selectTab(.sessions)) {
+      $0.selectedTab = .sessions
+      $0.settings = nil
+    }
+    await store.send(.selectTab(.settings)) {
+      $0.selectedTab = .settings
+      $0.settings = SettingsFeature.State(
+        connection: self.connection, liveActivityEnabled: false, liveActivityShowsTitles: false
+      )
+    }
+  }
+
+  /// The Live Activity toggles are `AppFeature`'s to act on: the list forwards both delegates
+  /// unchanged and keeps no state of its own.
+  @Test func settingsLiveActivityDelegatesAreForwarded() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.settings = SettingsFeature.State(connection: connection)
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.settings(.presented(.delegate(.liveActivityToggled(false)))))
+    await store.receive(\.delegate.liveActivityToggled, false)
+    await store.send(.settings(.presented(.delegate(.liveActivityShowsTitlesToggled(false)))))
+    await store.receive(\.delegate.liveActivityShowsTitlesToggled, false)
+  }
+
+  // MARK: Push registration (Task C4)
+
+  @Test func requestAuthorizationRegistersWhenAuthorized() async {
+    let push = PushClient.inMemory(granted: true)
+    let registered = LockIsolated<(token: String, env: String, version: String)?>(nil)
+    // Start with push "unavailable" so a successful registration visibly flips the flag on.
+    var initial = SessionListFeature.State(connection: connection)
+    initial.pushAvailable = false
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.push = push.client
+      $0.preferences = .inMemory()
+      $0.hermesREST.registerPush = { @Sendable _, token, env, version in
+        registered.setValue((token, env, version))
+      }
+    }
+
+    // The ready branch requests authorization; granted → observe tokens.
+    await store.send(.requestPushAuthorization)
+    // APNs delivers a device token.
+    push.emit(token: "deadbeef")
+    await store.receive(\.pushTokenReceived)
+    await store.receive(\.pushRegistered) {
+      $0.pushAvailable = true
+    }
+    #expect(registered.value?.token == "deadbeef")
+    #expect(registered.value?.env == PushClient.apnsEnv)
+    #expect(registered.value?.version == "1.2.3") // the in-memory client's app version
+    await store.send(.onDisappear) // cancels the token-observe effect
+  }
+
+  @Test func requestAuthorizationDoesNothingWhenNotAuthorized() async {
+    let push = PushClient.inMemory(granted: false)
+    let registered = LockIsolated(false)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.push = push.client
+      $0.hermesREST.registerPush = { @Sendable _, _, _, _ in
+        registered.setValue(true)
+      }
+    }
+
+    // Denied → the token stream is never observed, so no registration happens.
+    await store.send(.requestPushAuthorization)
+    push.emit(token: "deadbeef") // ignored — no consumer
+    await store.finish()
+    #expect(registered.value == false)
+    #expect(store.state.pushAvailable == true) // unchanged (no definitive 404)
+  }
+
+  @Test func tokenRotationReRegisters() async {
+    let push = PushClient.inMemory(granted: true)
+    let tokens = LockIsolated<[String]>([])
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.push = push.client
+      $0.preferences = .inMemory()
+      $0.hermesREST.registerPush = { @Sendable _, token, _, _ in
+        tokens.withValue { $0.append(token) }
+      }
+    }
+
+    await store.send(.requestPushAuthorization)
+    push.emit(token: "tok1")
+    await store.receive(\.pushTokenReceived)
+    await store.receive(\.pushRegistered)
+    // The OS rotates the token — a second emission re-registers.
+    push.emit(token: "tok2")
+    await store.receive(\.pushTokenReceived)
+    await store.receive(\.pushRegistered)
+    #expect(tokens.value == ["tok1", "tok2"])
+    await store.send(.onDisappear)
+  }
+
+  @Test func registerPush404DisablesPushCapability() async {
+    let push = PushClient.inMemory(granted: true)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.push = push.client
+      $0.preferences = .inMemory()
+      $0.hermesREST.registerPush = { @Sendable _, _, _, _ in throw RESTError.notFound }
+    }
+
+    await store.send(.requestPushAuthorization)
+    push.emit(token: "deadbeef")
+    await store.receive(\.pushTokenReceived)
+    await store.receive(\.pushRegisterFailed) {
+      $0.pushAvailable = false // plugin absent → capability-gated off
+    }
+    await store.send(.onDisappear)
+  }
+
+  @Test func settingsDisconnectDismissesAndBubblesUp() async {
+    var initial = SessionListFeature.State(connection: connection, selectedTab: .settings)
+    initial.settings = SettingsFeature.State(connection: connection)
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.settings(.presented(.delegate(.disconnect)))) {
+      $0.settings = nil
+      $0.selectedTab = .sessions
+    }
+    await store.receive(\.delegate.disconnect)
+  }
+
+  @Test func settingsReconnectTriggersReload() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.settings = SettingsFeature.State(connection: connection)
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [Session(id: "s1")] }
+    }
+
+    await store.send(.settings(.presented(.delegate(.reconnect))))
+    await store.receive(\.pulledToRefresh) {
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "s1")]
+      $0.statusSessions = [Session(id: "s1")]
+      $0.seenCounts = ["s1": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+  }
+
+  @Test func settingsTokenSavedUpdatesConnection() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.settings = SettingsFeature.State(connection: connection)
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.settings(.presented(.delegate(.tokenSaved("newtok"))))) {
+      $0.connection.token = "newtok"
+      $0.settings?.connection.token = "newtok" // the open tab mirrors the list's connection
+    }
+  }
+
+  // MARK: - Grouping mode
+
+
+
+  // MARK: - Cron section visibility
+
+
+
+
+
+// MARK: - Date sections
+
+  /// Gregorian, New York, en_US, Monday-first — the bucket suite's pinned calendar.
+  private let sectionCalendar = SessionDateBucketTests.calendar()
+
+  private func localDate(_ month: Int, _ day: Int, _ hour: Int = 10) -> Date {
+    SessionDateBucketTests.date(2026, month, day, hour)
+  }
+
+  @Test func taskCapturesTheSessionListCalendar() async {
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.sessionListCalendar = sectionCalendar
+      $0.continuousClock = TestClock()
+      $0.hermesProfiles.list = { @Sendable _ in throw RESTError.notFound }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [] }
+    }
+
+    await store.send(.task) {
+      $0.now = self.now
+      $0.calendar = self.sectionCalendar // captured from the dependency with `now`
+      $0.isLoading = true
+    }
+    await store.receive(\.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.profilesResponse.failure)
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = []
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.isLoading = false
+      $0.cronJobsSupported = false
+    }
+    await store.send(.onDisappear)
+  }
+
+  @Test func pollTickAcrossTheDayRolloverRebucketsDateSections() async {
+    let session = Session(id: "s1", updatedAt: localDate(6, 18, 10))
+    let currentDate = LockIsolated(SessionDateBucketTests.thuNoon) // Thu 18 Jun, noon
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [session],
+        now: SessionDateBucketTests.thuNoon,
+        calendar: sectionCalendar,
+        seenCounts: ["s1": 0]
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = DateGenerator { currentDate.value }
+      $0.sessionListCalendar = sectionCalendar
+      $0.preferences.loadSeenCounts = { ["s1": 0] }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [session] }
+    }
+    #expect(store.state.dateSections.map(\.id) == ["today"])
+    #expect(store.state.dateSections.map(\.label) == ["Today"])
+
+    // The poll refreshes `now` past the NEXT nominal day's 4 AM rollover — the same row
+    // (unchanged on the server) re-buckets under "Yesterday" with no new ticker.
+    let nextMorning = localDate(6, 19, 5)
+    currentDate.setValue(nextMorning)
+    await store.send(.pollTick)
+    await store.receive(\.pulledToRefresh) {
+      $0.now = nextMorning
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.statusSessions = [session]
+    }
+    await store.receive(\.cronJobsResponse.failure) { $0.cronJobsSupported = false }
+    #expect(store.state.dateSections.map(\.id) == ["yesterday"])
+    #expect(store.state.dateSections.map(\.label) == ["Yesterday"])
+    #expect(store.state.dateSections.flatMap { $0.entries.map(\.id) } == ["s1"])
+  }
+
+  @Test func dateSectionsExcludePinnedAndCronRowsAndKeepBranchClustersIntact() {
+    let sessions = [
+      Session(id: "today", updatedAt: localDate(6, 18, 11)),
+      Session(id: "pinned", updatedAt: localDate(6, 18, 9)),
+      Session(id: "cron_job1_1", updatedAt: localDate(6, 18, 8), source: "cron"),
+      // A stale parent from last week, lifted by its fresh branch: the whole cluster
+      // lands in "Today" (never split across a header).
+      Session(id: "parent", updatedAt: localDate(6, 10)),
+      Session(id: "branch", updatedAt: localDate(6, 18, 7), parentSessionID: "parent"),
+      Session(id: "yesterday", updatedAt: localDate(6, 17)),
+      Session(id: "lastWeek", updatedAt: localDate(6, 9)),
+      Session(id: "undated"),
+    ]
+    let state = SessionListFeature.State(
+      connection: connection,
+      sessions: IdentifiedArray(uniqueElements: sessions),
+      now: SessionDateBucketTests.thuNoon,
+      calendar: sectionCalendar,
+      pinnedIDs: ["pinned"]
+    )
+
+    let sections = state.dateSections
+    #expect(sections.map(\.id) == ["today", "yesterday", "last-week", SessionDateSection.olderID])
+    #expect(sections.map(\.label) == ["Today", "Yesterday", "Last week", "Older"])
+    #expect(sections[0].entries.map(\.id) == ["today", "parent", "branch"])
+    #expect(sections[0].entries.map(\.branchStem) == [nil, nil, "└─ "])
+    let sectionedIDs = sections.flatMap { $0.entries.map(\.id) }
+    #expect(!sectionedIDs.contains("pinned")) // owns the Pinned section
+    #expect(!sectionedIDs.contains("cron_job1_1")) // owns the Cron Jobs section
+    // The sections are exactly the chronological lane, split — nothing dropped or reordered.
+    #expect(sectionedIDs == state.chronologicalEntries.map(\.id))
+  }
+
+  // MARK: - Bottom-bar tabs
+
+  @Test func selectTabSwitchesTheRenderedTab() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection, cronJobs: [CronJob(id: "job1")])
+    ) {
+      SessionListFeature()
+    }
+
+    #expect(store.state.effectiveTab == .sessions) // a launch starts on Sessions
+    await store.send(.selectTab(.cron)) {
+      $0.selectedTab = .cron
+    }
+    #expect(store.state.effectiveTab == .cron)
+    await store.send(.selectTab(.sessions)) {
+      $0.selectedTab = .sessions
+    }
+  }
+
+  /// The Cron Jobs tab exists only with cron content and outside search: losing either
+  /// falls back to Sessions without forgetting the selection.
+  @Test func cronTabFallsBackToSessionsWithoutCronContentOrWhileSearching() {
+    var state = SessionListFeature.State(connection: connection, selectedTab: .cron)
+    #expect(state.showsTabBar, "Settings is always a tab, so the pill always shows")
+    #expect(state.availableTabs == [.sessions, .settings])
+    #expect(state.effectiveTab == .sessions, "no cron content: no Cron Jobs tab")
+
+    state.cronJobs = [CronJob(id: "job1")]
+    #expect(state.availableTabs == [.sessions, .cron, .settings])
+    #expect(state.effectiveTab == .cron)
+
+    state.searchQuery = "deploy"
+    #expect(!state.showsTabBar, "search is a Sessions-only mode")
+    #expect(state.effectiveTab == .sessions)
+    #expect(state.selectedTab == .cron)
+
+    state.searchQuery = ""
+    state.isSearchPresented = true
+    #expect(!state.showsTabBar, "an open search field hides the tabs before any query")
+  }
+
+  // MARK: - Search field
+
+  @Test func searchButtonOpensTheFieldAndCloseWithoutAQueryJustHidesIt() async {
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    }
+
+    await store.send(.searchButtonTapped) {
+      $0.isSearchPresented = true
+    }
+    await store.send(.searchCloseTapped) {
+      $0.isSearchPresented = false
+    }
+  }
+
+  /// Closing with a live query clears it and reloads the normal list at once — the stale
+  /// search results must not linger until the next poll.
+  @Test func searchCloseWithAQueryClearsItAndReloadsTheList() async {
+    let fetched = LockIsolated<[SessionSourceFilter]>([])
+    let hit = Session(id: "hit", preview: "deploy")
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection, sessions: [hit], searchQuery: "deploy", isSearchPresented: true
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, source in
+        fetched.withValue { $0.append(source) }
+        return source == .interactive ? [Session(id: "s1", title: "Chat")] : []
+      }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in [] }
+    }
+    store.exhaustivity = .off
+
+    await store.send(.searchCloseTapped) {
+      $0.isSearchPresented = false
+      $0.searchQuery = ""
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.sessions = [Session(id: "s1", title: "Chat")]
+    }
+    #expect(fetched.value == [.interactive, .cron])
+  }
+
+  @Test func chronologicalSessionsAreRecencyOrderedAndExcludePinned() {
+    var state = SessionListFeature.State(connection: connection)
+    state.sessions = [
+      Session(id: "a", updatedAt: Date(timeIntervalSince1970: 100)),
+      Session(id: "b", updatedAt: Date(timeIntervalSince1970: 300)),
+      Session(id: "c", updatedAt: Date(timeIntervalSince1970: 200)),
+    ]
+    state.pinnedIDs = ["b"] // pinned → excluded from the chronological body
+
+    #expect(state.chronologicalSessions.map(\.id) == ["c", "a"]) // recency desc, pinned dropped
+  }
+
+  // MARK: - Archived sheet
+
+  @Test func archivedButtonPresentsTheSheet() async {
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    }
+
+    await store.send(.archivedButtonTapped) {
+      $0.archivedSheetGeneration = 1 // each presentation is a new correlation generation
+      $0.archived = ArchivedSessionsFeature.State(
+        connection: self.connection,
+        now: Date(timeIntervalSince1970: 0) // the list's default `now`
+      )
+    }
+  }
+
+  @Test func openingFromArchivedDismissesSheetAndForwardsOpen() async {
+    let session = Session(id: "a", title: "Old")
+    var initial = SessionListFeature.State(connection: connection)
+    initial.archived = ArchivedSessionsFeature.State(connection: connection, sessions: [session])
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.archived(.presented(.delegate(.openSession(session))))) {
+      $0.archived = nil // sheet dismissed
+    }
+    await store.receive(\.delegate.openSession) // forwarded to the main stack
+  }
+
+  @Test func archivedSheetSeedsDeleteSupportedFromTheList() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.deleteSupported = false // an earlier delete already got the 404/405 verdict
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.archivedButtonTapped) {
+      $0.archivedSheetGeneration = 1
+      $0.archived = ArchivedSessionsFeature.State(
+        connection: self.connection,
+        now: Date(timeIntervalSince1970: 0),
+        deleteSupported: false // seeded — the sheet hides Delete from the start
+      )
+    }
+  }
+
+  @Test func archivedSheetDeleteUnsupportedMirrorsOntoTheList() async {
+    var initial = SessionListFeature.State(connection: connection)
+    initial.archived = ArchivedSessionsFeature.State(connection: connection)
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    // The sheet's delete answered 404/405 → the list's own flag flips too, so its
+    // Delete affordances (swipe default, context menu, settings row) hide as well.
+    await store.send(.archived(.presented(.delegate(.deleteUnsupported)))) {
+      $0.deleteSupported = false
+    }
+  }
+
+  @Test func archivedSheetDeleteRunsTheRoundTripAtTheListAndReinjectsSuccess() async {
+    // The sheet's delegate hands over the DELETE with its rollback payload; the
+    // round-trip runs HERE (a presented child's effects die with the sheet, so a
+    // sheet-run DELETE would be cancelled by Done/swipe-down mid-flight).
+    // `sessionDeleted` is forwarded FIRST (cache wipe + possible slot teardown in
+    // `AppFeature`), and the success is re-injected into the still-presented sheet.
+    let deleted = LockIsolated<[(String, String?)]>([])
+    var initial = SessionListFeature.State(connection: connection)
+    var sheet = ArchivedSessionsFeature.State(connection: connection)
+    sheet.deletingIDs = ["a"] // the sheet already removed the row and raised its guard
+    initial.archived = sheet
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.deleteSession = { @Sendable _, id, profile in
+        deleted.withValue { $0.append((id, profile)) }
+      }
+    }
+
+    await store.send(.archived(.presented(.delegate(.deleted(
+      id: "a", session: Session(id: "a", title: "Old"), index: 0
+    )))))
+    await store.receive(\.delegate.sessionDeleted)
+    await store.receive(\.archivedDeleteSucceeded)
+    // Confirmation delegate (badge clear in `AppFeature`) + re-injection into the sheet.
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+    await store.receive(\.archived.presented.deleteSucceeded) {
+      $0.archived?.deletingIDs = []
+    }
+    #expect(deleted.value.map(\.0) == ["a"])
+    #expect(deleted.value.first?.1 == nil) // unscoped sheet → no profile threaded
+  }
+
+  @Test func archivedSheetDeleteThreadsTheSheetsProfileScope() async {
+    // The round-trip (now parent-run) still scopes the DELETE to the profile the sheet
+    // was presented under.
+    let profile = LockIsolated<String??>(nil)
+    var initial = SessionListFeature.State(connection: connection)
+    var sheet = ArchivedSessionsFeature.State(connection: connection, profileName: "work")
+    sheet.deletingIDs = ["a"]
+    initial.archived = sheet
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.deleteSession = { @Sendable _, _, p in profile.setValue(.some(p)) }
+    }
+
+    await store.send(.archived(.presented(.delegate(.deleted(
+      id: "a", session: Session(id: "a"), index: 0
+    )))))
+    await store.receive(\.delegate.sessionDeleted)
+    await store.receive(\.archivedDeleteSucceeded)
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+    await store.receive(\.archived.presented.deleteSucceeded) {
+      $0.archived?.deletingIDs = []
+    }
+    #expect(profile.value == .some("work"))
+  }
+
+  @Test func archivedSheetUnderLiteralDefaultSeedsAndDeletesWithDefault() async {
+    // #114: with the profiles API and the default profile selected, the sheet is seeded
+    // with the LITERAL "default" (not nil), and a delete started INSIDE the sheet reaches
+    // the parent via the delegate, whose round-trip sends `profile: "default"`.
+    let profile = LockIsolated<String??>(nil)
+    var initial = SessionListFeature.State(connection: connection)
+    initial.profilesSupported = true // selectedProfileName defaults to "default"
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.deleteSession = { @Sendable _, _, p in profile.setValue(.some(p)) }
+    }
+
+    await store.send(.archivedButtonTapped) {
+      $0.archivedSheetGeneration = 1
+      $0.archived = ArchivedSessionsFeature.State(
+        connection: self.connection,
+        profileName: "default", // literal, not the legacy default→nil
+        now: Date(timeIntervalSince1970: 0)
+      )
+    }
+    let row = Session(id: "a", title: "Old")
+    await store.send(.archived(.presented(.archivedResponse(.success([row]))))) {
+      $0.archived?.sessions = [row]
+    }
+    await store.send(.archived(.presented(.deleteButtonTapped(id: "a")))) {
+      $0.archived?.sessions = []
+      $0.archived?.deletingIDs = ["a"]
+    }
+    await store.receive(\.archived.presented.delegate.deleted)
+    await store.receive(\.delegate.sessionDeleted)
+    await store.receive(\.archivedDeleteSucceeded)
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+    await store.receive(\.archived.presented.deleteSucceeded) {
+      $0.archived?.deletingIDs = []
+    }
+    #expect(profile.value == .some("default"))
+  }
+
+  @Test func archivedSheetWithoutProfilesAPISeedsNilProfile() async {
+    // No profiles API → the sheet stays unscoped even with "default" selected, keeping
+    // those agents' archived list/restore/delete requests byte-identical.
+    var initial = SessionListFeature.State(connection: connection)
+    initial.profilesSupported = false
+    initial.selectedProfileName = SessionListFeature.State.defaultProfileName
+    let store = TestStore(initialState: initial) { SessionListFeature() }
+
+    await store.send(.archivedButtonTapped) {
+      $0.archivedSheetGeneration = 1
+      $0.archived = ArchivedSessionsFeature.State(
+        connection: self.connection,
+        profileName: nil,
+        now: Date(timeIntervalSince1970: 0)
+      )
+    }
+  }
+
+  @Test func archivedSheetDeleteSurvivesSheetDismissal() async {
+    // THE reason the round-trip is parent-run: dismissing the sheet (Done / swipe-down)
+    // while the DELETE is still in flight must not cancel it — the cache and badge were
+    // already updated, so a silently dropped request would leave the session alive on
+    // the server with no trace client-side.
+    let gate = AsyncStream.makeStream(of: Void.self)
+    let deleted = LockIsolated(false)
+    var initial = SessionListFeature.State(connection: connection)
+    var sheet = ArchivedSessionsFeature.State(connection: connection)
+    sheet.deletingIDs = ["a"]
+    initial.archived = sheet
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in
+        // Parks until released — keeps the DELETE in flight across the dismissal.
+        var iterator = gate.stream.makeAsyncIterator()
+        await iterator.next()
+        deleted.setValue(true)
+      }
+    }
+
+    await store.send(.archived(.presented(.delegate(.deleted(
+      id: "a", session: Session(id: "a"), index: 0
+    )))))
+    await store.receive(\.delegate.sessionDeleted)
+    // Done/swipe-down while the DELETE is parked mid-flight.
+    await store.send(.archived(.dismiss)) {
+      $0.archived = nil
+    }
+    // Releasing the request proves it stayed alive past the dismissal.
+    gate.continuation.yield()
+    gate.continuation.finish()
+    await store.receive(\.archivedDeleteSucceeded)
+    // The confirmation delegate still fires (badge clear); with the sheet gone there is
+    // nothing to re-inject into.
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+    await store.finish()
+    #expect(deleted.value)
+  }
+
+  @Test(arguments: [RESTError.notFound, RESTError.server(status: 405, detail: nil)])
+  func archivedSheetDeleteVerdictAfterDismissalStillFlipsTheListsCapability(error: RESTError) async {
+    // The sheet is gone when the 404/405 verdict lands — the capability is server-wide,
+    // so the list's own flag still flips (silently), hiding its Delete affordances.
+    let gate = AsyncStream.makeStream(of: Void.self)
+    var initial = SessionListFeature.State(connection: connection)
+    var sheet = ArchivedSessionsFeature.State(connection: connection)
+    sheet.deletingIDs = ["a"]
+    initial.archived = sheet
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in
+        var iterator = gate.stream.makeAsyncIterator()
+        await iterator.next()
+        throw error
+      }
+    }
+
+    await store.send(.archived(.presented(.delegate(.deleted(
+      id: "a", session: Session(id: "a"), index: 0
+    )))))
+    await store.receive(\.delegate.sessionDeleted)
+    await store.send(.archived(.dismiss)) {
+      $0.archived = nil
+    }
+    gate.continuation.yield()
+    gate.continuation.finish()
+    await store.receive(\.archivedDeleteFailed) {
+      $0.deleteSupported = false
+    }
+    await store.finish()
+    #expect(store.state.loadError == nil) // the flip is silent
+  }
+
+  @Test func archivedSheetDeleteFailureAfterDismissalSurfacesTheListBanner() async {
+    // A transient failure landing after the sheet was dismissed must not vanish — the
+    // session is still on the server, so the list surfaces the banner instead.
+    let gate = AsyncStream.makeStream(of: Void.self)
+    var initial = SessionListFeature.State(connection: connection)
+    var sheet = ArchivedSessionsFeature.State(connection: connection)
+    sheet.deletingIDs = ["a"]
+    initial.archived = sheet
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in
+        var iterator = gate.stream.makeAsyncIterator()
+        await iterator.next()
+        throw RESTError.unreachable
+      }
+    }
+
+    await store.send(.archived(.presented(.delegate(.deleted(
+      id: "a", session: Session(id: "a"), index: 0
+    )))))
+    await store.receive(\.delegate.sessionDeleted)
+    await store.send(.archived(.dismiss)) {
+      $0.archived = nil
+    }
+    gate.continuation.yield()
+    gate.continuation.finish()
+    await store.receive(\.archivedDeleteFailed) {
+      $0.loadError = "Couldn’t delete the session."
+    }
+    await store.finish()
+    #expect(store.state.deleteSupported) // a transient failure is no capability verdict
+  }
+
+  @Test func archivedSheetDeleteFailureWhilePresentedIsReinjectedIntoTheSheet() async {
+    // While the sheet still owns the delete (guard holds the id), the failure routes back
+    // into it: rollback + banner happen in the sheet, and the list stays untouched.
+    var initial = SessionListFeature.State(connection: connection)
+    var sheet = ArchivedSessionsFeature.State(connection: connection)
+    sheet.deletingIDs = ["a"]
+    initial.archived = sheet
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.deleteSession = { @Sendable _, _, _ in throw RESTError.unreachable }
+    }
+
+    await store.send(.archived(.presented(.delegate(.deleted(
+      id: "a", session: Session(id: "a", title: "Old"), index: 0
+    )))))
+    await store.receive(\.delegate.sessionDeleted)
+    await store.receive(\.archivedDeleteFailed)
+    await store.receive(\.archived.presented.deleteFailed) {
+      $0.archived?.deletingIDs = []
+      $0.archived?.sessions = [Session(id: "a", title: "Old")]
+      $0.archived?.loadError = "Couldn’t delete the session."
+    }
+    await store.finish()
+    #expect(store.state.loadError == nil) // the failure surfaced in the sheet, not the list
+  }
+
+  @Test func archivedSheetDeleteOutcomeFromAPreviousPresentationIsNotReinjected() async {
+    // Delete "a" in sheet presentation #1, dismiss while the DELETE is slow, reopen
+    // (`archivedSheetGeneration` bumps), and delete the still-listed "a" AGAIN. The id
+    // alone can no longer correlate outcomes: presentation #1's late FAILURE must not
+    // clear presentation #2's own guard and resurrect its row (it lands at the list,
+    // like any post-dismissal failure) — and presentation #2's real outcome must still
+    // re-inject afterwards.
+    var initial = SessionListFeature.State(connection: connection)
+    initial.archivedSheetGeneration = 2 // presentation #2 is live
+    var sheet = ArchivedSessionsFeature.State(connection: connection)
+    sheet.deletingIDs = ["a"] // #2's own in-flight delete of the SAME id
+    initial.archived = sheet
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    }
+
+    // Presentation #1's stale failure: applied at the list; the sheet stays untouched.
+    await store.send(.archivedDeleteFailed(
+      id: "a", session: Session(id: "a", title: "Old"), index: 0, generation: 1,
+      error: .unreachable
+    )) {
+      $0.loadError = "Couldn’t delete the session."
+    }
+    #expect(store.state.archived?.deletingIDs == ["a"]) // guard intact
+    #expect(store.state.archived?.sessions.isEmpty == true) // no resurrected row
+
+    // Presentation #2's real outcome (current generation) still re-injects.
+    await store.send(.archivedDeleteSucceeded(id: "a", generation: 2))
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+    await store.receive(\.archived.presented.deleteSucceeded) {
+      $0.archived?.deletingIDs = []
+    }
+  }
+
+  // MARK: - Profiles (Task 8)
+
+  @Test func taskPopulatesProfilesAndScopedSessions() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.saveSelectedProfileID("work")
+    let scopedFetch = LockIsolated<[String]>([])
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      $0.preferences = prefs
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesProfiles.list = { @Sendable _ in
+        [Profile(name: "default", isDefault: true), Profile(name: "work")]
+      }
+      $0.hermesProfiles.sessions = { @Sendable _, profile, _, _, _, _, source in
+        if source == .interactive { scopedFetch.withValue { $0.append(profile) } }
+        return [Session(id: "w1", title: "Work")]
+      }
+    }
+
+    await store.send(.task) {
+      $0.now = self.now
+      $0.isLoading = true
+      $0.selectedProfileName = "work" // loaded from the persisted pref
+    }
+    await store.receive(\.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.profilesResponse.success) {
+      $0.profilesSupported = true
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "work")]
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "w1", title: "Work")]
+      $0.statusSessions = [Session(id: "w1", title: "Work")]
+      $0.seenCounts = ["w1": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    #expect(scopedFetch.value == ["work"]) // scoped to the active profile
+    await store.send(.onDisappear)
+  }
+
+  /// A slow `/api/profiles` must survive the list loads that land while it's in flight (here
+  /// the 10 s poll): they used to share its cancel id, so the probe died silently and the
+  /// seeded `profilesSupported` showed a profile menu with no profiles until the next `.task`.
+  @Test func slowProfilesProbeSurvivesAPollTick() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.saveSelectedProfileID("work")
+    let clock = TestClock()
+    var initial = SessionListFeature.State(connection: connection, selectedProfileName: "work")
+    initial.profilesSupported = true // seeded from the persisted verdict, as at launch
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = clock
+      $0.preferences = prefs
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesProfiles.list = { @Sendable _ in
+        try await clock.sleep(for: .seconds(15))
+        return [Profile(name: "default", isDefault: true), Profile(name: "work")]
+      }
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, _ in [] }
+    }
+    store.exhaustivity = .off
+
+    await store.send(.task)
+    await clock.advance(by: .seconds(10))
+    await store.receive(\.pollTick)
+    await store.receive(\.pulledToRefresh)
+    #expect(store.state.profiles.isEmpty, "the probe is still in flight")
+
+    await clock.advance(by: .seconds(5))
+    await store.receive(\.profilesResponse.success) {
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "work")]
+    }
+    #expect(store.state.selectedProfileName == "work")
+    await store.send(.onDisappear)
+  }
+
+  @Test func notFoundFromProfilesListFallsBackToUnscopedFetch() async {
+    let unscopedFetch = LockIsolated(0)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      $0.hermesProfiles.list = { @Sendable _ in throw RESTError.notFound }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, source in
+        if source == .interactive { unscopedFetch.withValue { $0 += 1 } }
+        return [Session(id: "s1")]
+      }
+    }
+
+    await store.send(.task) {
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.profilesResponse.failure) // old agent → selector stays hidden
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "s1")]
+      $0.statusSessions = [Session(id: "s1")]
+      $0.seenCounts = ["s1": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    #expect(store.state.profilesSupported == false)
+    #expect(unscopedFetch.value == 1) // today's /api/sessions, not the scoped endpoint
+    await store.send(.onDisappear)
+  }
+
+  @Test func selectProfilePersistsResetsAndRefetches() async {
+    let prefs = PreferencesClient.inMemory()
+    let scopedFetch = LockIsolated<[String]>([])
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        statusSessions: [Session(id: "d1", isActive: true)],
+        searchQuery: "stale",
+        profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+        selectedProfileName: "default",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesProfiles.sessions = { @Sendable _, profile, _, _, _, _, source in
+        if source == .interactive { scopedFetch.withValue { $0.append(profile) } }
+        return [Session(id: "w1")]
+      }
+    }
+
+    await store.send(.selectProfile(name: "work")) {
+      $0.selectedProfileName = "work"
+      // The old profile's rows never feed the widgets: "unknown" until the scoped refetch.
+      $0.statusSessions = nil
+      $0.searchQuery = "" // list UI reset on switch
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "w1")]
+      $0.statusSessions = [Session(id: "w1")]
+      $0.seenCounts = ["w1": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    #expect(prefs.loadSelectedProfileID() == "work") // persisted
+    #expect(scopedFetch.value == ["work"]) // refetched scoped to the new profile
+
+    // Re-selecting the same profile is a no-op (no refetch).
+    await store.send(.selectProfile(name: "work"))
+    #expect(scopedFetch.value == ["work"])
+  }
+
+  @Test func createdProfileDelegateRefreshesAndSelects() async {
+    let prefs = PreferencesClient.inMemory()
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        profiles: [Profile(name: "default", isDefault: true)],
+        selectedProfileName: "default",
+        profilesSupported: true,
+        addProfile: AddProfileFeature.State(connection: connection)
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesProfiles.list = { @Sendable _ in
+        [Profile(name: "default", isDefault: true), Profile(name: "fresh")]
+      }
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, _ in [] }
+    }
+
+    await store.send(.addProfile(.presented(.delegate(.created(name: "fresh"))))) {
+      $0.addProfile = nil // sheet dismissed
+    }
+    // Refresh the profile list (no fetch yet)…
+    await store.receive(\.profilesRefreshed) {
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "fresh")]
+    }
+    // …then switch to the freshly-created profile and fetch its (scoped) sessions.
+    await store.receive(\.selectProfile) {
+      $0.selectedProfileName = "fresh"
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = []
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.isLoading = false
+      $0.cronJobsSupported = false
+    }
+    #expect(prefs.loadSelectedProfileID() == "fresh")
+  }
+
+  @Test func deleteConfirmationDeletesAndReHomesToDefault() async {
+    let prefs = PreferencesClient.inMemory()
+    let deleted = LockIsolated<[String]>([])
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        statusSessions: [Session(id: "w1")],
+        profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+        selectedProfileName: "work",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesProfiles.delete = { @Sendable _, name in deleted.withValue { $0.append(name) } }
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, _ in [] }
+    }
+
+    // Tapping delete presents the confirmation dialog.
+    await store.send(.deleteProfileButtonTapped(name: "work")) {
+      $0.confirmationDialog = ConfirmationDialogState {
+        TextState("Delete profile?")
+      } actions: {
+        ButtonState(role: .destructive, action: .confirmDeleteProfile(name: "work")) {
+          TextState("Delete")
+        }
+        ButtonState(role: .cancel) {
+          TextState("Cancel")
+        }
+      } message: {
+        TextState("This permanently deletes the profile and its sessions on the server.")
+      }
+    }
+
+    // Confirming deletes on the server.
+    await store.send(.confirmationDialog(.presented(.confirmDeleteProfile(name: "work")))) {
+      $0.confirmationDialog = nil
+    }
+    // Success removes the profile and, since it was active, re-homes to default + refetches.
+    await store.receive(\.deleteProfileSucceeded) {
+      $0.profiles = [Profile(name: "default", isDefault: true)]
+      $0.selectedProfileName = "default"
+      $0.statusSessions = nil  // the deleted profile's rows are gone with it
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = []
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.isLoading = false
+      $0.cronJobsSupported = false
+    }
+    #expect(deleted.value == ["work"])
+    #expect(prefs.loadSelectedProfileID() == "default")
+  }
+
+  @Test func defaultProfileCannotBeRenamedOrDeleted() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        profiles: [Profile(name: "default", isDefault: true)],
+        selectedProfileName: "default",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    }
+
+    // Both actions are guarded in the reducer — no state change, no effects.
+    await store.send(.renameProfileButtonTapped(name: "default", newName: "renamed"))
+    await store.send(.deleteProfileButtonTapped(name: "default"))
+    #expect(store.state.confirmationDialog == nil)
+    #expect(store.state.profiles.map(\.name) == ["default"])
+  }
+
+  @Test func renameCustomProfileIsOptimisticWithRollback() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.saveSelectedProfileID("work")
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+        selectedProfileName: "work",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesProfiles.rename = { @Sendable _, _, _ in throw RESTError.server(status: 400) }
+    }
+
+    // Optimistic rename updates the profile + the active selection.
+    await store.send(.renameProfileButtonTapped(name: "work", newName: "work-renamed")) {
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "work-renamed")]
+      $0.selectedProfileName = "work-renamed"
+    }
+
+    // The PATCH throws → rollback restores the prior profiles + selection.
+    await store.receive(\.renameProfileFailed) {
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "work")]
+      $0.selectedProfileName = "work"
+      $0.loadError = "Couldn’t rename the profile."
+    }
+    #expect(prefs.loadSelectedProfileID() == "work")
+  }
+
+  // (a) The persisted profile no longer exists on the server → re-home to default and fetch
+  // the default's (scoped) sessions unscoped-by-default-name.
+  @Test func taskReHomesWhenPersistedProfileMissing() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.saveSelectedProfileID("gone")
+    let scopedFetch = LockIsolated<[String]>([])
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      $0.preferences = prefs
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesProfiles.list = { @Sendable _ in
+        [Profile(name: "default", isDefault: true), Profile(name: "work")]
+      }
+      $0.hermesProfiles.sessions = { @Sendable _, profile, _, _, _, _, source in
+        if source == .interactive { scopedFetch.withValue { $0.append(profile) } }
+        return [Session(id: "d1")]
+      }
+    }
+
+    await store.send(.task) {
+      $0.now = self.now
+      $0.isLoading = true
+      $0.selectedProfileName = "gone" // loaded from the (now-stale) persisted pref
+    }
+    await store.receive(\.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.profilesResponse.success) {
+      $0.profilesSupported = true
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "work")]
+      $0.selectedProfileName = "default" // re-homed because "gone" is absent
+    }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "d1")]
+      $0.statusSessions = [Session(id: "d1")]
+      $0.seenCounts = ["d1": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+    #expect(prefs.loadSelectedProfileID() == "default") // persisted re-home
+    #expect(scopedFetch.value == ["default"]) // scoped to default
+    await store.send(.onDisappear)
+  }
+
+  // (b) Deleting a NON-active profile removes it without touching the selection or refetching.
+  @Test func deleteNonActiveProfileLeavesSelectionAndDoesNotRefetch() async {
+    let prefs = PreferencesClient.inMemory()
+    let deleted = LockIsolated<[String]>([])
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+        selectedProfileName: "default",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesProfiles.delete = { @Sendable _, name in deleted.withValue { $0.append(name) } }
+    }
+
+    await store.send(.deleteProfileButtonTapped(name: "work")) {
+      $0.confirmationDialog = ConfirmationDialogState {
+        TextState("Delete profile?")
+      } actions: {
+        ButtonState(role: .destructive, action: .confirmDeleteProfile(name: "work")) {
+          TextState("Delete")
+        }
+        ButtonState(role: .cancel) {
+          TextState("Cancel")
+        }
+      } message: {
+        TextState("This permanently deletes the profile and its sessions on the server.")
+      }
+    }
+    await store.send(.confirmationDialog(.presented(.confirmDeleteProfile(name: "work")))) {
+      $0.confirmationDialog = nil
+    }
+    // Non-active deletion: profile removed, selection untouched, no re-home/refetch.
+    await store.receive(\.deleteProfileSucceeded) {
+      $0.profiles = [Profile(name: "default", isDefault: true)]
+    }
+    #expect(deleted.value == ["work"])
+    #expect(store.state.selectedProfileName == "default")
+  }
+
+  // (c) Delete RPC throws → surface the error and leave the list intact.
+  @Test func deleteProfileFailureSetsErrorAndRestoresList() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+        selectedProfileName: "default",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.hermesProfiles.delete = { @Sendable _, _ in throw RESTError.server(status: 500) }
+    }
+
+    await store.send(.deleteProfileButtonTapped(name: "work")) {
+      $0.confirmationDialog = ConfirmationDialogState {
+        TextState("Delete profile?")
+      } actions: {
+        ButtonState(role: .destructive, action: .confirmDeleteProfile(name: "work")) {
+          TextState("Delete")
+        }
+        ButtonState(role: .cancel) {
+          TextState("Cancel")
+        }
+      } message: {
+        TextState("This permanently deletes the profile and its sessions on the server.")
+      }
+    }
+    await store.send(.confirmationDialog(.presented(.confirmDeleteProfile(name: "work")))) {
+      $0.confirmationDialog = nil
+    }
+    await store.receive(\.deleteProfileFailed) {
+      $0.loadError = "Couldn’t delete the profile."
+    }
+    // The list is untouched — nothing was optimistically removed.
+    #expect(store.state.profiles.map(\.name) == ["default", "work"])
+  }
+
+  // (d) A real differing rename succeeds: the RPC is called with (name, newName), the
+  // optimistic name stands, no rollback.
+  @Test func renameCustomProfileSucceeds() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.saveSelectedProfileID("work")
+    let renamed = LockIsolated<[(String, String)]>([])
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+        selectedProfileName: "work",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesProfiles.rename = { @Sendable _, name, newName in
+        renamed.withValue { $0.append((name, newName)) }
+      }
+    }
+
+    await store.send(.renameProfileButtonTapped(name: "work", newName: "work-renamed")) {
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "work-renamed")]
+      $0.selectedProfileName = "work-renamed"
+    }
+    await store.receive(\.renameProfileSucceeded) // optimistic value stands, no rollback
+    #expect(renamed.value.count == 1)
+    #expect(renamed.value.first?.0 == "work")
+    #expect(renamed.value.first?.1 == "work-renamed")
+    #expect(prefs.loadSelectedProfileID() == "work-renamed")
+  }
+
+  /// The header's Edit menu (Rename / Delete) shows only for a KNOWN custom profile: never
+  /// the default one, never before the profiles list holds the selection, and never on an
+  /// agent without the profiles API.
+  @Test func canEditSelectedProfileOnlyForAKnownCustomProfile() {
+    var state = SessionListFeature.State(
+      connection: connection,
+      profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+      selectedProfileName: "work",
+      profilesSupported: true
+    )
+    #expect(state.canEditSelectedProfile)
+
+    state.selectedProfileName = "default"
+    #expect(!state.canEditSelectedProfile, "the default profile is never editable")
+
+    state.selectedProfileName = "personal"
+    #expect(!state.canEditSelectedProfile, "a selection the list hasn't loaded yet")
+
+    state.selectedProfileName = "work"
+    state.profilesSupported = false
+    #expect(!state.canEditSelectedProfile, "no profiles API")
+  }
+
+  // The rename ALERT flow: open seeds the draft, confirm forwards the entered name.
+  @Test func renameProfileAlertOpensAndConfirms() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.saveSelectedProfileID("work")
+    let renamed = LockIsolated<[(String, String)]>([])
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+        selectedProfileName: "work",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+      $0.hermesProfiles.rename = { @Sendable _, name, newName in
+        renamed.withValue { $0.append((name, newName)) }
+      }
+    }
+
+    // Opening the alert seeds the draft with the current name.
+    await store.send(.renameProfileTapped(name: "work")) {
+      $0.renamingProfileName = "work"
+      $0.profileRenameDraft = "work"
+    }
+    // User edits the draft.
+    await store.send(.binding(.set(\.profileRenameDraft, "work-2"))) {
+      $0.profileRenameDraft = "work-2"
+    }
+    // Confirm clears the alert and forwards the entered name to the rename action.
+    await store.send(.confirmRenameProfile) {
+      $0.renamingProfileName = nil
+      $0.profileRenameDraft = ""
+    }
+    await store.receive(\.renameProfileButtonTapped) {
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "work-2")]
+      $0.selectedProfileName = "work-2"
+    }
+    await store.receive(\.renameProfileSucceeded)
+    #expect(renamed.value.first?.1 == "work-2")
+  }
+
+  // Cancelling the rename alert dismisses it without renaming.
+  @Test func renameProfileAlertCancelDismisses() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+        selectedProfileName: "work",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.renameProfileTapped(name: "work")) {
+      $0.renamingProfileName = "work"
+      $0.profileRenameDraft = "work"
+    }
+    await store.send(.cancelRenameProfile) {
+      $0.renamingProfileName = nil
+      $0.profileRenameDraft = ""
+    }
+    #expect(store.state.profiles.map(\.name) == ["default", "work"])
+  }
+
+  // MARK: Event-driven working glow (Task 7)
+
+  // The open chat's `runningChanged(false)` clears the row's working flag (glow) INSTANTLY —
+  // no poll required.
+  @Test func setSessionRunningFalseClearsGlowImmediately() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "s1", isActive: true)]
+      )
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.setSessionRunning(id: "s1", running: false)) {
+      $0.sessions[id: "s1"]?.isActive = false
+    }
+  }
+
+  // The open chat's `runningChanged(true)` lights the row's working flag (glow) instantly.
+  @Test func setSessionRunningTrueSetsGlowImmediately() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "s1", isActive: false)]
+      )
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.setSessionRunning(id: "s1", running: true)) {
+      $0.sessions[id: "s1"]?.isActive = true
+    }
+  }
+
+  // No-op when the patched id isn't in the current list (archived/filtered) — the poll handles
+  // not-open sessions. And a no-op when the flag already matches (no spurious state change).
+  @Test func setSessionRunningIgnoresUnknownIdAndNoChange() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "s1", isActive: true)]
+      )
+    ) {
+      SessionListFeature()
+    }
+
+    // Unknown id → no state change.
+    await store.send(.setSessionRunning(id: "ghost", running: true))
+    // Same value → no state change.
+    await store.send(.setSessionRunning(id: "s1", running: true))
+  }
+
+  // MARK: statusSessions (the widgets' unfiltered source)
+
+  @Test func setSessionRunningPatchesStatusSessions() async {
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "s1", isActive: false)],
+        statusSessions: [Session(id: "s1", isActive: false)]
+      )
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.setSessionRunning(id: "s1", running: true)) {
+      $0.sessions[id: "s1"]?.isActive = true
+      $0.statusSessions?[id: "s1"]?.isActive = true
+    }
+  }
+
+  @Test func setSessionRunningPatchesStatusSessionsWhileASearchHidesTheRow() async {
+    // A search narrowed `sessions` to a hit; the running row is only in the unfiltered source.
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "hit")],
+        statusSessions: [Session(id: "hit"), Session(id: "s1", isActive: true)],
+        searchQuery: "hit"
+      )
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.setSessionRunning(id: "s1", running: false)) {
+      $0.statusSessions?[id: "s1"]?.isActive = false
+    }
+  }
+
+  @Test func setSessionRunningBeforeTheFirstFetchLeavesStatusSessionsUnknown() async {
+    // No unfiltered fetch yet: the slot's event must not conjure a source (the gate stays shut).
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection)
+    ) {
+      SessionListFeature()
+    }
+
+    await store.send(.setSessionRunning(id: "s1", running: true))
+    #expect(store.state.statusSessions == nil)
+  }
+
+  @Test func searchResponseLeavesStatusSessionsUntouched() async {
+    let clock = TestClock()
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        sessions: [Session(id: "s1", isActive: true), Session(id: "s2")],
+        statusSessions: [Session(id: "s1", isActive: true), Session(id: "s2")]
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.continuousClock = clock
+      $0.preferences = .inMemory()
+      $0.hermesREST.search = { @Sendable _, _, _ in [Session(id: "s2")] }
+    }
+
+    await store.send(\.binding.searchQuery, "two") { $0.searchQuery = "two" }
+    await clock.advance(by: .milliseconds(300))
+    await store.receive(\.sessionsResponse.success) {
+      $0.sessions = [Session(id: "s2")]
+      $0.seenCounts = ["s2": 0]
+      // `statusSessions` keeps the unfiltered list: the widgets never follow a search.
+    }
+  }
+
+  @Test func renamingTheSelectedProfileKeepsStatusSessions() async {
+    // Same sessions under a new name: no reset (only a scope change to OTHER rows resets).
+    let store = TestStore(
+      initialState: SessionListFeature.State(
+        connection: connection,
+        statusSessions: [Session(id: "w1")],
+        profiles: [Profile(name: "default", isDefault: true), Profile(name: "work")],
+        selectedProfileName: "work",
+        profilesSupported: true
+      )
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+      $0.hermesProfiles.rename = { @Sendable _, _, _ in }
+    }
+
+    await store.send(.renameProfileButtonTapped(name: "work", newName: "job")) {
+      $0.profiles = [Profile(name: "default", isDefault: true), Profile(name: "job")]
+      $0.selectedProfileName = "job"
+    }
+    await store.receive(\.renameProfileSucceeded)
+    #expect(store.state.statusSessions == [Session(id: "w1")])
+  }
+
+  // Poll backstop: a session that started working ELSEWHERE (no open chat, so no delegate)
+  // is reconciled by the next REST poll flipping `isActive` true.
+  @Test func pollReconcilesSessionStartedElsewhere() async {
+    let clock = TestClock()
+    let active = LockIsolated(false)
+    let store = TestStore(
+      initialState: SessionListFeature.State(connection: connection)
+    ) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = clock
+      $0.hermesProfiles.list = { @Sendable _ in throw RESTError.notFound }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in
+        [Session(id: "s1", isActive: active.value)]
+      }
+    }
+
+    await store.send(.task) {
+      $0.now = self.now
+      $0.isLoading = true
+    }
+    await store.receive(\.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.profilesResponse.failure)
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "s1", isActive: false)]
+      $0.statusSessions = [Session(id: "s1", isActive: false)]
+      $0.seenCounts = ["s1": 0]
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+    }
+
+    // The agent starts working this session elsewhere; the next poll observes it.
+    active.setValue(true)
+    await clock.advance(by: .seconds(10))
+    await store.receive(\.pollTick)
+    await store.receive(\.pulledToRefresh) { $0.isLoading = true }
+    await store.receive(\.sessionsResponse.success) {
+      $0.isLoading = false
+      $0.sessions = [Session(id: "s1", isActive: true)] // glow lit by the poll backstop
+      // …and the widgets count a desktop-started turn the same way.
+      $0.statusSessions = [Session(id: "s1", isActive: true)]
+    }
+
+    await store.send(.onDisappear)
+  }
+
+  // MARK: Literal default profile on the wire (#114)
+
+  /// One wire-profile scenario: the selected profile, whether the agent has the profiles
+  /// API, and the `profile` every session-scoped mutation must carry.
+  struct WireProfileCase: Sendable, CustomTestStringConvertible {
+    let selected: String
+    let profilesSupported: Bool
+    let expected: String?
+    var testDescription: String {
+      "\(selected), profilesSupported=\(profilesSupported) → \(expected ?? "nil")"
+    }
+  }
+
+  nonisolated static let wireProfileCases: [WireProfileCase] = [
+    // An omitted profile is the server's LAUNCH profile, not "default" — send it literally.
+    WireProfileCase(selected: "default", profilesSupported: true, expected: "default"),
+    WireProfileCase(selected: "work", profilesSupported: true, expected: "work"),
+    // No profiles API → byte-identical legacy requests (no `profile` at all).
+    WireProfileCase(selected: "default", profilesSupported: false, expected: nil),
+    WireProfileCase(selected: "work", profilesSupported: false, expected: nil),
+  ]
+
+  @Test(arguments: wireProfileCases)
+  func scopedProfileNameIsTheLiteralSelectionWhenProfilesAreSupported(_ c: WireProfileCase) {
+    var state = SessionListFeature.State(connection: connection, selectedProfileName: c.selected)
+    state.profilesSupported = c.profilesSupported
+    #expect(state.scopedProfileName == c.expected)
+  }
+
+  @Test(arguments: wireProfileCases)
+  func archiveSendsTheWireProfile(_ c: WireProfileCase) async {
+    let captured = LockIsolated<[String?]>([])
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a")], selectedProfileName: c.selected
+    )
+    initial.profilesSupported = c.profilesSupported
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Archive session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmArchive(id: "a")) { TextState("Archive") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+      $0.hermesREST.archive = { @Sendable _, _, _, profile in
+        captured.withValue { $0.append(profile) }
+      }
+    }
+
+    await store.send(.confirmationDialog(.presented(.confirmArchive(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = []
+      $0.archivingIDs = ["a"]
+    }
+    await store.receive(\.delegate.sessionArchived)
+    await store.receive(\.archiveSucceeded) {
+      $0.archivingIDs = []
+    }
+    await store.finish()
+    #expect(captured.value == [c.expected])
+  }
+
+  @Test(arguments: wireProfileCases)
+  func renameSendsTheWireProfile(_ c: WireProfileCase) async {
+    let captured = LockIsolated<[String?]>([])
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a", title: "Old")],
+      selectedProfileName: c.selected
+    )
+    initial.profilesSupported = c.profilesSupported
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.hermesREST.rename = { @Sendable _, _, _, profile in
+        captured.withValue { $0.append(profile) }
+      }
+    }
+
+    await store.send(.renameButtonTapped(id: "a")) {
+      $0.renamingID = "a"
+      $0.renameDraft = "Old"
+    }
+    await store.send(\.binding.renameDraft, "New") {
+      $0.renameDraft = "New"
+    }
+    await store.send(.confirmRename) {
+      $0.sessions[id: "a"]?.title = "New"
+      $0.renamingID = nil
+      $0.renameDraft = ""
+      $0.renamingInFlightIDs = ["a"]
+    }
+    await store.receive(\.renameSucceeded) {
+      $0.renamingInFlightIDs = []
+    }
+    await store.finish()
+    #expect(captured.value == [c.expected])
+  }
+
+  @Test(arguments: wireProfileCases)
+  func deleteSendsTheWireProfile(_ c: WireProfileCase) async {
+    let captured = LockIsolated<[String?]>([])
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "a")], selectedProfileName: c.selected
+    )
+    initial.profilesSupported = c.profilesSupported
+    initial.confirmationDialog = ConfirmationDialogState {
+      TextState("Delete session?")
+    } actions: {
+      ButtonState(role: .destructive, action: .confirmDelete(id: "a")) { TextState("Delete") }
+    }
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+      $0.hermesREST.deleteSession = { @Sendable _, _, profile in
+        captured.withValue { $0.append(profile) }
+      }
+    }
+
+    await store.send(.confirmationDialog(.presented(.confirmDelete(id: "a")))) {
+      $0.confirmationDialog = nil
+      $0.sessions = []
+      $0.deletingIDs = ["a"]
+    }
+    await store.receive(\.delegate.sessionDeleted)
+    await store.receive(\.deleteSucceeded) {
+      $0.deletingIDs = []
+    }
+    await store.receive(\.delegate.sessionDeleteSucceeded)
+    await store.finish()
+    #expect(captured.value == [c.expected])
+  }
+
+  // Search hits are opened and mutated under `scopedProfileName`, so the search must come
+  // from that same profile (an unscoped search hits the server's launch profile).
+  @Test(arguments: wireProfileCases)
+  func searchSendsTheWireProfile(_ c: WireProfileCase) async {
+    let clock = TestClock()
+    let captured = LockIsolated<[String?]>([])
+    var initial = SessionListFeature.State(connection: connection, selectedProfileName: c.selected)
+    initial.profilesSupported = c.profilesSupported
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.continuousClock = clock
+      $0.hermesREST.search = { @Sendable _, _, profile in
+        captured.withValue { $0.append(profile) }
+        return []
+      }
+    }
+
+    await store.send(\.binding.searchQuery, "foo") { $0.searchQuery = "foo" }
+    await clock.advance(by: .milliseconds(300))
+    await store.receive(\.sessionsResponse.success)
+    #expect(captured.value == [c.expected])
+  }
+
+  // A successful probe persists the selection — "default" included — which is what
+  // `AppFeature.makeHomeState` reads as "this agent has the profiles API" next launch.
+  @Test func profilesProbeSuccessPersistsTheSelectionIncludingDefault() async {
+    let prefs = PreferencesClient.inMemory()
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesProfiles.sessions = { @Sendable _, _, _, _, _, _, _ in [] }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+    }
+
+    #expect(prefs.loadSelectedProfileID() == nil)
+    await store.send(.profilesResponse(.success([Profile(name: "default")]))) {
+      $0.profilesSupported = true
+      $0.profiles = [Profile(name: "default")]
+      $0.isLoading = true
+      $0.now = self.now
+    }
+    #expect(prefs.loadSelectedProfileID() == "default")
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = []
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.isLoading = false
+      $0.cronJobsSupported = false
+    }
+  }
+
+  // Only the probe's 404 verdict withdraws the persisted capability; a transient failure
+  // keeps it for the next launch.
+  @Test(arguments: [(RESTError.notFound, nil), (RESTError.unreachable, "work")] as [(RESTError, String?)])
+  func profilesProbeFailureWithdrawsThePersistedVerdictOnlyOnNotFound(
+    error: RESTError, persisted: String?
+  ) async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.saveSelectedProfileID("work")
+    var initial = SessionListFeature.State(connection: connection, selectedProfileName: "work")
+    initial.profilesSupported = true
+    initial.statusSessions = [Session(id: "w1")]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.preferences = prefs
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [] }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+    }
+
+    await store.send(.profilesResponse(.failure(error))) {
+      $0.profilesSupported = false
+      // The scope moved from "work" to the unscoped launch profile: different rows.
+      $0.statusSessions = nil
+      $0.isLoading = true
+      $0.now = self.now
+    }
+    #expect(prefs.loadSelectedProfileID() == persisted)
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = []
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.isLoading = false
+      $0.cronJobsSupported = false
+    }
+  }
+
+  /// `(captured, selected)`: a failed removal captured under one wire scope while the list
+  /// now shows another — including a pre-probe `nil` capture (the server's launch profile)
+  /// against the literal "default" list.
+  nonisolated static let otherWireScopeCases: [(String?, String)] = [
+    (nil, "default"), (nil, "work"), ("default", "work"),
+  ]
+
+  // A failed archive/delete captured under a DIFFERENT wire scope than the list now shows
+  // is not re-inserted.
+  @Test(arguments: otherWireScopeCases)
+  func archiveFailureFromAnotherWireScopeDoesNotReinsert(captured: String?, selected: String) async {
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "b")], selectedProfileName: selected
+    )
+    initial.profilesSupported = true
+    initial.archivingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(.archiveFailed(
+      id: "a", session: Session(id: "a"), index: 0, pinIndex: nil,
+      seenCount: nil, profileName: captured, searchQuery: "", error: .unreachable
+    )) {
+      $0.archivingIDs = []
+      $0.loadError = "Couldn’t archive the session."
+    }
+  }
+
+  @Test(arguments: otherWireScopeCases)
+  func deleteFailureFromAnotherWireScopeDoesNotReinsert(captured: String?, selected: String) async {
+    var initial = SessionListFeature.State(
+      connection: connection, sessions: [Session(id: "b")], selectedProfileName: selected
+    )
+    initial.profilesSupported = true
+    initial.deletingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(.deleteFailed(
+      id: "a", session: Session(id: "a"), index: 0, pinIndex: nil,
+      seenCount: nil, profileName: captured, searchQuery: "", error: .unreachable
+    )) {
+      $0.deletingIDs = []
+      $0.loadError = "Couldn’t delete the session."
+    }
+  }
+
+  @Test func archiveFailureUnderLiteralDefaultStillReinsertsUnderDefault() async {
+    // The literal `"default"` captured with profiles supported matches the same selection.
+    let session = Session(id: "a")
+    var initial = SessionListFeature.State(connection: connection, sessions: [Session(id: "b")])
+    initial.profilesSupported = true
+    initial.archivingIDs = ["a"]
+    let store = TestStore(initialState: initial) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = .inMemory()
+    }
+
+    await store.send(.archiveFailed(
+      id: "a", session: session, index: 1, pinIndex: nil,
+      seenCount: nil, profileName: "default", searchQuery: "", error: .unreachable
+    )) {
+      $0.archivingIDs = []
+      $0.sessions = [Session(id: "b"), session]
+      $0.loadError = "Couldn’t archive the session."
+    }
+  }
+
+  // MARK: - Onboarding tips (#136)
+
+  /// Hide hides the row at once and persists the dismissal.
+  @Test func onboardingTipsHidePersists() async {
+    let prefs = PreferencesClient.inMemory()
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.preferences = prefs
+    }
+
+    #expect(store.state.showsOnboardingTipsRow) // shown until dismissed
+    await store.send(.onboardingTipsHideButtonTapped) {
+      $0.showsOnboardingTips = false
+    }
+    #expect(prefs.loadOnboardingTipsDismissed())
+  }
+
+  /// A dismissal persisted earlier keeps the row hidden when the list re-reads its prefs.
+  @Test func onboardingTipsStayHiddenAfterReload() async {
+    let prefs = PreferencesClient.inMemory()
+    prefs.saveOnboardingTipsDismissed(true)
+    let store = TestStore(initialState: SessionListFeature.State(connection: connection)) {
+      SessionListFeature()
+    } withDependencies: {
+      $0.date = .constant(now)
+      $0.continuousClock = TestClock()
+      $0.preferences = prefs
+      $0.hermesProfiles.list = { @Sendable _ in throw RESTError.notFound }
+      $0.hermesREST.pushPluginStatus = { @Sendable _ in .unknown }
+      $0.hermesREST.cronJobs = { @Sendable _, _ in throw RESTError.notFound }
+      $0.hermesREST.sessions = { @Sendable _, _, _, _, _ in [] }
+    }
+
+    await store.send(.task) {
+      $0.now = now
+      $0.isLoading = true
+      $0.showsOnboardingTips = false
+    }
+    await store.receive(\.setupPush)
+    await store.receive(\.pushPluginStatusLoaded)
+    await store.receive(\.profilesResponse.failure)
+    await store.receive(\.sessionsResponse.success) {
+      $0.statusSessions = [] // an empty list holds `isLoading` for the cron fetch
+    }
+    await store.receive(\.cronJobsResponse.failure) {
+      $0.cronJobsSupported = false
+      $0.isLoading = false
+    }
+    #expect(!store.state.showsOnboardingTipsRow)
+    #expect(!store.state.showsInlineEmptyPlaceholder) // no leading cards → centred overlay
+    await store.send(.onDisappear)
+  }
+
+  /// The profiles tip needs the profiles API (it points at the pill, hidden without it).
+  @Test func onboardingTipsGateTheProfilesTip() {
+    var state = SessionListFeature.State(connection: connection)
+    #expect(state.onboardingTips == [.voice, .swipeActions])
+    state.profilesSupported = true
+    #expect(state.onboardingTips == [.profiles, .voice, .swipeActions])
+  }
+
+  /// The row renders only on the Sessions tab with no query, and pulls the empty placeholder
+  /// under it like the push card does.
+  @Test func onboardingTipsRowHidesWhileSearchingAndOnTheCronTab() {
+    var state = SessionListFeature.State(connection: connection)
+    #expect(state.showsOnboardingTipsRow)
+    #expect(state.showsInlineEmptyPlaceholder) // empty list + tips → placeholder row under them
+    state.isLoading = true
+    #expect(!state.showsInlineEmptyPlaceholder) // still loading → no placeholder at all
+    state.isLoading = false
+    state.searchQuery = "parser"
+    #expect(!state.showsOnboardingTipsRow)
+    state.searchQuery = ""
+    state.cronJobs = [CronJob(id: "j1", name: "Nightly")]
+    state.selectedTab = .cron
+    #expect(!state.showsOnboardingTipsRow)
+    state.selectedTab = .sessions
+    state.showsOnboardingTips = false
+    #expect(!state.showsOnboardingTipsRow)
+    #expect(!state.showsInlineEmptyPlaceholder) // no tips, no card → the centred overlay
+  }
+}

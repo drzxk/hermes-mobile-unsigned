@@ -1,0 +1,2253 @@
+import ComposableArchitecture
+import Foundation
+
+/// Lists Hermes sessions for the connected server and supports full-text search.
+/// Tapping a row or the "+" button emits a delegate the parent uses to open chat
+/// (resume) or start a new session — `ChatFeature` wiring lands in Task 8.
+@Reducer
+public struct SessionListFeature {
+  public struct PinMutation: Equatable, Sendable {
+    public var pinned: Bool
+    public var previousIndex: Int?
+    public var profileName: String
+
+    public init(pinned: Bool, previousIndex: Int?, profileName: String) {
+      self.pinned = pinned
+      self.previousIndex = previousIndex
+      self.profileName = profileName
+    }
+  }
+
+  @ObservableState
+  public struct State: Equatable {
+    public var connection: ServerConnection
+    public var sessions: IdentifiedArrayOf<Session>
+    /// The last UNFILTERED list response — the source of the widgets / Live Activity
+    /// projection (`AgentStatusProjection`), which must not follow a search's result set
+    /// the way `sessions` does. `nil` until the first successful unfiltered fetch of the
+    /// process: that is the "a cached guess never starts anything" gate. Replaced on each
+    /// unfiltered success (search responses never touch it), patched by `setSessionRunning`
+    /// like `sessions`, and reset to `nil` when the list's profile scope changes (the
+    /// refetch repopulates it).
+    public var statusSessions: IdentifiedArrayOf<Session>?
+    public var searchQuery: String
+    public var isLoading: Bool
+    public var loadError: String?
+    /// Reference "now" for relative row timestamps AND the date-section buckets; set from
+    /// the date dependency on load (and so on every poll) so the value is controllable
+    /// (deterministic snapshots/tests) and the headers re-bucket on the poll cadence.
+    public var now: Date
+    /// The calendar `dateSections` buckets with (time zone + first weekday). Captured from
+    /// `@Dependency(\.sessionListCalendar)` on load alongside `now`, so TestStore and
+    /// snapshots pin it through the dependency / init instead of the device's calendar.
+    public var calendar: Calendar
+    /// Last-seen message count per session id (persisted) — drives the unread indicator.
+    public var seenCounts: [String: Int]
+    /// Pinned session ids (persisted), order = display order in the top "Pinned" section.
+    public var pinnedIDs: [String]
+    /// Profile pin writes in flight, guarding duplicate pin changes for the same ID.
+    public var pinMutations: [String: PinMutation] = [:]
+    /// Ids whose archive PATCH is currently IN FLIGHT. Transient: an id is added when its
+    /// PATCH starts and removed on BOTH success and failure. While an id is here, a list/search
+    /// response that lands during the in-flight window filters it out (suppressing a stale row),
+    /// and the poll skips. On success the in-flight fetch is cancelled so no stale response can
+    /// land after the id is cleared; future authoritative fetches exclude archived sessions
+    /// server-side (`archived=exclude`), so no permanent filter is needed.
+    public var archivingIDs: Set<String>
+    /// Ids whose `DELETE /api/sessions/{id}` is currently IN FLIGHT. Same transient
+    /// contract as `archivingIDs`: added when the DELETE starts, removed on success and
+    /// failure; while an id is here a landing list/search response filters it out and the
+    /// poll skips, so a reload can't resurrect the optimistically-removed row.
+    public var deletingIDs: Set<String>
+    /// Whether the agent supports `DELETE /api/sessions/{id}`. Default `true` (optimistic,
+    /// no pre-probe); flipped off by a delete answering the missing-endpoint verdict
+    /// (`RESTError.isMissingEndpointVerdict` — 404 OR 405, see that property). When false
+    /// all Delete affordances hide and the swipe default clamps back to Archive
+    /// (`effectiveSwipeAction`).
+    public var deleteSupported: Bool
+    /// The persisted default destructive action for the trailing swipe (Archive/Delete);
+    /// loaded with the other prefs. Views must read `effectiveSwipeAction`, which clamps
+    /// this to `.archive` while the agent lacks the DELETE capability.
+    public var defaultSwipeAction: SessionSwipeAction
+    /// The bottom bar's selected tab. In-memory only (a launch starts on Sessions); views
+    /// read `effectiveTab`, which falls back to Sessions while there is no cron content (or,
+    /// for Settings, no seeded `settings` state).
+    public var selectedTab: SessionListTab
+    /// Whether the Sessions tab's search field is open — opened from the toolbar's search
+    /// button, it replaces the nav bar row; closing clears the query.
+    public var isSearchPresented: Bool
+    /// Ids whose rename PATCH is currently IN FLIGHT. Transient: added when the PATCH starts,
+    /// removed on success/failure. While non-empty the poll skips (like `archivingIDs`) so a
+    /// fetch landing mid-PATCH can't clobber the optimistic title with the server's old one.
+    public var renamingInFlightIDs: Set<String>
+    /// Session currently being renamed (drives the rename alert's presentation); nil = no alert.
+    public var renamingID: Session.ID?
+    /// The editable title text bound to the rename alert's `TextField`.
+    public var renameDraft: String
+    /// The profiles available on the connected agent (default + any custom). Populated from
+    /// `profiles.list` on `.task`; empty when the agent lacks the profiles API.
+    public var profiles: IdentifiedArrayOf<Profile>
+    /// The device-local selected profile name. Defaults to the persisted pref or `"default"`.
+    /// New chats + the scoped session list are bound to this profile.
+    public var selectedProfileName: String
+    /// Whether the agent exposes `/api/profiles` (set false on a 404 from `profiles.list`).
+    /// When false the selector is hidden and the list uses today's unscoped `/api/sessions`.
+    public var profilesSupported: Bool
+    /// Custom profile currently being renamed (drives the rename alert); nil = no alert.
+    public var renamingProfileName: String?
+    /// The editable text bound to the profile-rename alert's `TextField`.
+    public var profileRenameDraft: String
+    /// Whether the connected agent exposes the `hermes-push` plugin (push registration
+    /// endpoint present). `true` once a `registerPush` succeeds; `false` on a definitive 404
+    /// (plugin not installed). Threaded into Settings so the notifications UI is capability-gated.
+    /// Defaults to `true` (optimistic) so we attempt registration before the first probe.
+    public var pushAvailable: Bool
+    /// The inline push card at the top of the Sessions tab, or `nil` for none. Set by
+    /// `setupPush`'s verdict: the plugin is ready but notification permission was never asked
+    /// → `.enableNotifications`; the plugin is not ready → `.installPlugin` — each only while
+    /// the prompt isn't snoozed. Every card button clears it. The system permission prompt
+    /// fires only from the card's Turn on button, never on list appearance.
+    public var pushCard: SessionListFeature.PushCard?
+    /// Whether the dismissible tips row (#136) is on: `true` until the user taps Hide, which
+    /// persists `onboardingTipsDismissed` (cleared on logout, so the next sign-in shows them
+    /// again). Seeded from the pref when the list is built and re-read with the other prefs.
+    /// Views read `showsOnboardingTipsRow`, which also hides it while searching / on Cron Jobs.
+    public var showsOnboardingTips: Bool
+    /// Cron jobs fetched from `GET /api/cron/jobs` — the Cron Jobs tab's rows. Empty until
+    /// the first fetch lands.
+    public var cronJobs: IdentifiedArrayOf<CronJob>
+    /// Whether the agent exposes `/api/cron/jobs` (set false on a definitive 404 — older
+    /// agent). When false the section renders today's flat cron-session rows and the jobs
+    /// fetch is skipped on subsequent polls.
+    public var cronJobsSupported: Bool
+    /// The job whose inline run-peek is expanded — single-open so the section stays
+    /// scannable (mirrors the desktop sidebar's peek).
+    public var expandedCronJobID: String?
+    /// The expanded job's recent runs, fetched from `GET /api/cron/jobs/{id}/runs` (newest
+    /// first, capped to `cronPeekLimit`): session rows (`isCron`, open a chat) plus
+    /// script-only `cron_output` rows (plain text). `nil` = not loaded yet (spinner), `[]` =
+    /// "No runs yet". One slot for the ONE expanded job — cleared whenever the expansion
+    /// changes, so a run list never shows under the wrong job.
+    public var expandedCronRuns: [Session]?
+    /// The expanded job's FIRST runs load failed ("Couldn't load runs"). A failed refresh
+    /// keeps the runs already shown and leaves this false.
+    public var expandedCronRunsFailed: Bool
+    /// Job ids whose trigger/pause/resume/delete request is IN FLIGHT. Transient double-fire
+    /// guard (mirrors `archivingIDs`): added when the request starts, removed on success/failure.
+    public var cronActionInFlightIDs: Set<String>
+    /// Non-`nil` while the transient "Session ID copied" toast is showing. Purely transient
+    /// confirmation state: raised by a copy, cleared by the timed expiry. It's a counter
+    /// rather than a `Bool` so a re-copy while the toast is already up is still an
+    /// observable change — that's what re-announces the copy to VoiceOver (a `Bool` would
+    /// stay `true` and the announcement would be swallowed).
+    public var copiedIDToastToken: Int?
+    /// The Settings TAB's state: seeded fresh when the tab is selected and dropped when it is
+    /// left (`closeSettingsTab()`), so it carries the old sheet's open/close semantics — a
+    /// re-seed on every visit, child effects cancelled on leave. `@Presents` so a child
+    /// `dismiss()` (Sign out, Reconnect, "Ask agent") still closes it.
+    @Presents public var settings: SettingsFeature.State?
+    @Presents public var archived: ArchivedSessionsFeature.State?
+    /// Monotonic count of `archived` sheet presentations, bumped each time the sheet is
+    /// (re)presented. The sheet's DELETE round-trips (parent-run — see
+    /// `Action.archivedDeleteSucceeded`) capture it at initiation so a late outcome can be
+    /// correlated with the presentation that started it: after a dismiss-and-reopen the
+    /// same session id can be deleted AGAIN, and re-injecting the FIRST request's outcome
+    /// into the new sheet would clear the new operation's guard and resurrect its row —
+    /// leaving the second request's real outcome with nowhere to land. A stale-generation
+    /// outcome is applied at the list instead (capability verdict / banner), exactly like
+    /// an outcome landing after dismissal.
+    public var archivedSheetGeneration: Int = 0
+    @Presents public var addProfile: AddProfileFeature.State?
+    /// Pin writes are single-flight per row, independently of archive/delete.
+    public func canChangePin(id: Session.ID) -> Bool {
+      sessions[id: id] != nil && pinMutations[id] == nil
+    }
+
+    /// Both list and search requests use the selected literal profile.
+    fileprivate var canWritePinsToServer: Bool { profilesSupported }
+
+    /// Stable across token refreshes and equivalent trailing-slash server URLs.
+    public var pinMigrationServerID: String {
+      connection.baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    @Presents public var confirmationDialog: ConfirmationDialogState<Action.Dialog>?
+
+    /// The default profile name — never renamable/deletable, and the implicit fallback.
+    public static let defaultProfileName = "default"
+
+    /// The device-local persisted profile selection, falling back to
+    /// `defaultProfileName`. The ONE fallback rule, shared by the list's `.task` prefs
+    /// reload and `AppFeature.makeHomeState`'s creation-time seeding (#46) — change it
+    /// here and both sites follow.
+    static func persistedProfileName(_ preferences: PreferencesClient) -> String {
+      preferences.loadSelectedProfileID() ?? defaultProfileName
+    }
+
+    /// Whether the last profiles probe on this server succeeded: a selection is persisted
+    /// on every probe success and selection change, and cleared on the probe's 404 and on
+    /// logout. Seeds `profilesSupported` in `AppFeature.makeHomeState` before the probe.
+    static func persistedProfilesSupported(_ preferences: PreferencesClient) -> Bool {
+      preferences.loadSelectedProfileID() != nil
+    }
+
+    public init(
+      connection: ServerConnection,
+      sessions: IdentifiedArrayOf<Session> = [],
+      statusSessions: IdentifiedArrayOf<Session>? = nil,
+      searchQuery: String = "",
+      isLoading: Bool = false,
+      loadError: String? = nil,
+      now: Date = Date(timeIntervalSince1970: 0),
+      calendar: Calendar = .autoupdatingCurrent,
+      seenCounts: [String: Int] = [:],
+      pinnedIDs: [String] = [],
+      pinMutations: [String: PinMutation] = [:],
+      archivingIDs: Set<String> = [],
+      deletingIDs: Set<String> = [],
+      deleteSupported: Bool = true,
+      defaultSwipeAction: SessionSwipeAction = .default,
+      selectedTab: SessionListTab = .sessions,
+      isSearchPresented: Bool = false,
+      renamingInFlightIDs: Set<String> = [],
+      renamingID: Session.ID? = nil,
+      renameDraft: String = "",
+      profiles: IdentifiedArrayOf<Profile> = [],
+      selectedProfileName: String = SessionListFeature.State.defaultProfileName,
+      profilesSupported: Bool = false,
+      renamingProfileName: String? = nil,
+      profileRenameDraft: String = "",
+      pushAvailable: Bool = true,
+      pushCard: SessionListFeature.PushCard? = nil,
+      showsOnboardingTips: Bool = true,
+      cronJobs: IdentifiedArrayOf<CronJob> = [],
+      cronJobsSupported: Bool = true,
+      expandedCronJobID: String? = nil,
+      expandedCronRuns: [Session]? = nil,
+      expandedCronRunsFailed: Bool = false,
+      cronActionInFlightIDs: Set<String> = [],
+      copiedIDToastToken: Int? = nil,
+      settings: SettingsFeature.State? = nil,
+      addProfile: AddProfileFeature.State? = nil
+    ) {
+      self.connection = connection
+      self.sessions = sessions
+      self.statusSessions = statusSessions
+      self.searchQuery = searchQuery
+      self.isLoading = isLoading
+      self.loadError = loadError
+      self.now = now
+      self.calendar = calendar
+      self.seenCounts = seenCounts
+      self.pinnedIDs = pinnedIDs
+      self.pinMutations = pinMutations
+      self.archivingIDs = archivingIDs
+      self.deletingIDs = deletingIDs
+      self.deleteSupported = deleteSupported
+      self.defaultSwipeAction = defaultSwipeAction
+      self.selectedTab = selectedTab
+      self.isSearchPresented = isSearchPresented
+      self.renamingInFlightIDs = renamingInFlightIDs
+      self.renamingID = renamingID
+      self.renameDraft = renameDraft
+      self.profiles = profiles
+      self.selectedProfileName = selectedProfileName
+      self.profilesSupported = profilesSupported
+      self.renamingProfileName = renamingProfileName
+      self.profileRenameDraft = profileRenameDraft
+      self.pushAvailable = pushAvailable
+      self.pushCard = pushCard
+      self.showsOnboardingTips = showsOnboardingTips
+      self.cronJobs = cronJobs
+      self.cronJobsSupported = cronJobsSupported
+      self.expandedCronJobID = expandedCronJobID
+      self.expandedCronRuns = expandedCronRuns
+      self.expandedCronRunsFailed = expandedCronRunsFailed
+      self.cronActionInFlightIDs = cronActionInFlightIDs
+      self.copiedIDToastToken = copiedIDToastToken
+      self.settings = settings
+      self.addProfile = addProfile
+    }
+
+    /// The WIRE profile threaded into every session-scoped call (list, search, cron,
+    /// archive/rename/delete, the archived sheet, and the chat's create/resume): the LITERAL
+    /// selected name — including `"default"` — whenever the agent has the profiles API, `nil`
+    /// only without it (so those agents get byte-identical requests). An omitted profile is
+    /// NOT read as `"default"` by the server: it means the dashboard process's LAUNCH profile
+    /// (`hermes -p work dashboard` → `work`), so dropping `"default"` would mutate the
+    /// wrong profile's `state.db` (#114).
+    public var scopedProfileName: String? {
+      profilesSupported ? selectedProfileName : nil
+    }
+
+    /// Whether the header offers the profile Edit menu (Rename / Delete): only for a KNOWN
+    /// custom profile — never the default one, and not before the profiles list has loaded
+    /// the selection (the rename/delete actions would no-op on an unknown name).
+    public var canEditSelectedProfile: Bool {
+      guard profilesSupported, let profile = profiles[id: selectedProfileName] else { return false }
+      return !profile.isDefault
+    }
+
+    /// The destructive action the trailing swipe actually offers: the persisted
+    /// preference, clamped back to `.archive` while the agent lacks the DELETE
+    /// capability (a stale `.delete` pref must never surface a dead button).
+    public var effectiveSwipeAction: SessionSwipeAction {
+      deleteSupported ? defaultSwipeAction : .archive
+    }
+
+    /// Dismiss everything the list can present (sheets, the action sheet, the rename alerts) —
+    /// for routing that can arrive while one is up (an App Intent, #93), so the chat it opens
+    /// isn't left behind a sheet. NOT the Settings tab: it is no presentation, and nil-ing it
+    /// here (from `AppFeature`, outside the list's `ifLet`) would leave its effects running. In
+    /// compact the chat's marker leaves the tab through `AppFeature`'s path rule; in regular
+    /// the chat seats in the detail column beside it.
+    mutating func dismissPresentations() {
+      archived = nil
+      addProfile = nil
+      confirmationDialog = nil
+      renamingID = nil
+      renameDraft = ""
+      renamingProfileName = nil
+      profileRenameDraft = ""
+    }
+
+    /// Copy the list facts Settings was seeded with into the open tab (no-op when closed).
+    /// Only the list-owned facts: the Live Activity prefs and the swipe default are Settings'
+    /// own (it writes them and tells the list).
+    mutating func syncSettingsSeed() {
+      guard var seeded = settings else { return }
+      seeded.connection = connection
+      seeded.pushAvailable = pushAvailable
+      seeded.deleteSupported = deleteSupported
+      seeded.profileName = scopedProfileName
+      if seeded != settings { settings = seeded }
+    }
+
+    /// Leave the Settings tab: drop its state and fall back to Sessions. Every path that
+    /// clears `settings` goes through here, so `selectedTab == .settings` never outlives it.
+    mutating func closeSettingsTab() {
+      settings = nil
+      if selectedTab == .settings {
+        selectedTab = .sessions
+      }
+    }
+
+    /// True while a search query is active — the list shows flat results, not date
+    /// sections.
+    public var isSearching: Bool {
+      !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// Cron-scheduled sessions, pulled out of the interactive list: the flat Cron Jobs
+    /// fallback for agents without the jobs API (with it they are not rendered and don't
+    /// gate the tab). Sorted by recency (`updatedAt` desc, `nil` last), mirroring
+    /// `chronologicalSessions`.
+    public var cronSessions: [Session] {
+      sessions.filter(\.isCron)
+        .sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
+    }
+
+    /// The non-cron remainder — everything the pinning/chronological/date-section computeds
+    /// operate on, so cron sessions never feed the interactive sections (a pinned-but-cron
+    /// id surfaces only under Cron Jobs).
+    public var interactiveSessions: [Session] {
+      sessions.filter { !$0.isCron }
+    }
+
+    /// Runs shown in a job's inline peek — enough to glance at history without turning the
+    /// section into a full history browser (mirrors the desktop sidebar's limit).
+    public static let cronPeekLimit = 5
+
+    /// The Cron Jobs tab's job rows, desktop-style: the fetched jobs only, sorted soonest
+    /// next-run first, no-next-run last, then title. A job's runs are NOT derived from the
+    /// session list (upstream `local-*` run ids carry no job id); the expanded job loads them
+    /// from `/runs` into `expandedCronRuns`. Empty when the agent lacks the jobs API — the view
+    /// then falls back to the flat `cronSessions` list.
+    public var sortedCronJobs: [CronJob] {
+      guard cronJobsSupported else { return [] }
+      return cronJobs.elements.sorted(by: Self.cronJobOrder)
+    }
+
+    /// Whether there is cron content for the Cron Jobs tab. With the jobs API only the jobs
+    /// count — a job with no runs stays reachable for Run now / Pause / Resume / Delete, and
+    /// runs (incl. a deleted job's) never bring the tab back on their own. Without it, the
+    /// flat fallback's cron runs.
+    public var hasCronContent: Bool {
+      cronJobsSupported ? !cronJobs.isEmpty : !cronSessions.isEmpty
+    }
+
+    /// Whether the bottom bar shows the tab pill: always (Settings is always a tab), except
+    /// while the search field is open or a query is active (search is a Sessions-only mode).
+    public var showsTabBar: Bool {
+      !isSearchPresented && !isSearching
+    }
+
+    /// The tabs the pill offers: Sessions, Cron Jobs only with cron content, then Settings.
+    public var availableTabs: [SessionListTab] {
+      hasCronContent ? [.sessions, .cron, .settings] : [.sessions, .settings]
+    }
+
+    /// The tab the home screen actually renders: `selectedTab` while the tab bar shows and
+    /// that tab exists, else Sessions — so a profile or poll that drops every cron row never
+    /// strands an empty tab, and a Settings selection without seeded state never renders.
+    public var effectiveTab: SessionListTab {
+      guard showsTabBar else { return .sessions }
+      switch selectedTab {
+      case .sessions: return .sessions
+      case .cron: return hasCronContent ? .cron : .sessions
+      case .settings: return settings != nil ? .settings : .sessions
+      }
+    }
+
+    /// Whether the Sessions tab shows the "No sessions" placeholder: no search hit (or, outside
+    /// search, no interactive session — cron runs live in their own tab) and nothing loading
+    /// or failed.
+    public var showsEmptyPlaceholder: Bool {
+      effectiveTab == .sessions && !isLoading && loadError == nil
+        && (isSearching ? sessions.isEmpty : interactiveSessions.isEmpty)
+    }
+
+    /// Whether the push card renders: a verdict set it, on the Sessions tab, and never with a
+    /// search query active. While it shows, the "No sessions" placeholder flows as a row under
+    /// it instead of floating centred over the list (where a tall card would collide with it).
+    public var showsPushCard: Bool {
+      pushCard != nil && effectiveTab == .sessions && !isSearching
+    }
+
+    /// Whether the tips row renders under the push card: not hidden by the user, on the
+    /// Sessions tab, and never with a search query active (like `showsPushCard`).
+    public var showsOnboardingTipsRow: Bool {
+      showsOnboardingTips && effectiveTab == .sessions && !isSearching
+    }
+
+    /// The tips the row offers, in order. The profiles tip needs the profiles API (the pill it
+    /// points at is hidden without it); voice and swipe actions are always available.
+    public var onboardingTips: [SessionListFeature.OnboardingTip] {
+      (profilesSupported ? [.profiles] : []) + [.voice, .swipeActions]
+    }
+
+    /// Whether the "No sessions" placeholder flows as a row under the leading cards (push card,
+    /// tips) instead of floating centred over the list, where it would collide with them.
+    public var showsInlineEmptyPlaceholder: Bool {
+      showsEmptyPlaceholder && (showsPushCard || showsOnboardingTipsRow)
+    }
+
+    /// A non-search list with no interactive session and no jobs known yet: the load's
+    /// sequential cron fetch decides whether a Cron Jobs tab appears, so `isLoading` holds
+    /// until that response lands and the list settles once (placeholder and tab bar together).
+    var awaitsCronJobs: Bool {
+      interactiveSessions.isEmpty && cronJobs.isEmpty && cronJobsSupported && !isSearching
+    }
+
+    /// Desktop-parity job ordering: soonest next run first, jobs without a next run sink
+    /// to the bottom, then title for stability.
+    private static func cronJobOrder(_ a: CronJob, _ b: CronJob) -> Bool {
+      switch (a.nextRunAt, b.nextRunAt) {
+      case let (l?, r?) where l != r: return l < r
+      case (.some, .none): return true
+      case (.none, .some): return false
+      default: return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+      }
+    }
+
+    /// Pinned sessions resolved from `pinnedIDs`, in pin order; stale ids are dropped. Cron
+    /// sessions are excluded (they belong to the Cron Jobs tab), even if pinned.
+    public var pinnedSessions: [Session] {
+      pinnedIDs.compactMap { id in sessions[id: id].flatMap { $0.isCron ? nil : $0 } }
+    }
+
+    /// The Pinned lane's rows with branch nesting applied WITHIN the pinned slice: a branch
+    /// nests (with its elbow stem) only when its parent is also pinned; a pinned branch
+    /// whose parent isn't pinned de-nests to a normal row. Top-level order stays the user's
+    /// pin order (`sortTopLevelByRecency: false`) — nesting is display-only and must not
+    /// reorder pins.
+    public var pinnedEntries: [SessionBranchEntry] {
+      flattenSessionsWithBranches(pinnedSessions, sortTopLevelByRecency: false)
+    }
+
+    /// Non-cron sessions not pinned — these feed the date sections.
+    public var unpinnedSessions: [Session] {
+      let pinned = Set(pinnedIDs)
+      return interactiveSessions.filter { !pinned.contains($0.id) }
+    }
+
+    /// Flat, last-active-ordered list of the unpinned sessions — the date sections' source
+    /// (pinned sessions render in the top "Pinned" section). `nil` dates sort last.
+    public var chronologicalSessions: [Session] {
+      unpinnedSessions.sorted { ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast) }
+    }
+
+    /// The chronological lane's rows with branch nesting applied: branches render under
+    /// their parent with elbow stems, and a parent cluster sorts by its freshest member
+    /// (activity on a branch lifts the whole group). Applied AFTER the cron partition —
+    /// cron rows never reach this lane. Orphans (parent pinned/absent) de-nest.
+    public var chronologicalEntries: [SessionBranchEntry] {
+      flattenSessionsWithBranches(chronologicalSessions)
+    }
+
+    /// The non-search list body: `chronologicalEntries` split into labelled update-date
+    /// sections (Today, Yesterday, … — see `SessionDateBucket`). Bucketed against `now`
+    /// (poll-refreshed), so headers re-bucket on the same cadence as the age labels. A
+    /// parent + branches cluster never splits across a header; pinned and cron rows never
+    /// appear here (they own their sections).
+    public var dateSections: [SessionDateSection] {
+      groupEntriesByDate(chronologicalEntries, now: now, calendar: calendar)
+    }
+
+    /// Sessions with new activity since the user last opened them. New agents own this
+    /// state server-side so Desktop and mobile agree; an absent field falls back to the
+    /// legacy device-local message-count watermark.
+    public var unreadSessionIDs: Set<Session.ID> {
+      Set(sessions.compactMap { session in
+        if let unread = session.unread { return unread ? session.id : nil }
+        guard let count = session.messageCount, let seen = seenCounts[session.id], count > seen
+        else { return nil }
+        return session.id
+      })
+    }
+  }
+
+  public enum Action: BindableAction {
+    case binding(BindingAction<State>)
+    case task
+    case onDisappear
+    case pulledToRefresh
+    case pollTick
+    case sessionsResponse(Result<[Session], RESTError>)
+    case sessionTapped(Session.ID)
+    case newSessionButtonTapped
+    case pinSession(id: Session.ID)
+    case unpinSession(id: Session.ID)
+    case pinMigrationFinished(server: String, id: Session.ID, profileName: String, error: RESTError?)
+    case pinWriteFinished(id: Session.ID, profileName: String, error: RESTError?)
+    /// Put a row's session id on the pasteboard and raise the transient confirmation toast.
+    case copyIDButtonTapped(id: Session.ID)
+    /// The copy toast's dwell time elapsed — hide it.
+    case copiedIDToastExpired
+    /// A bottom-bar tab was tapped. Selecting Settings seeds its state; leaving it drops it.
+    case selectTab(SessionListTab)
+    /// The toolbar's search button: open the search field.
+    case searchButtonTapped
+    /// The search field's close button: hide it and clear the query.
+    case searchCloseTapped
+    case archiveButtonTapped(id: Session.ID)
+    /// Archive RPC succeeded — clear the transient in-flight guard and cancel (or, when
+    /// one is pending, restart — see `cancelOrRestartFetch`) any fetch that started
+    /// during the PATCH window so a stale response can't land after the guard is gone.
+    case archiveSucceeded(id: Session.ID)
+    /// Archive RPC failed — the server still has the session. Clear the in-flight guard and
+    /// roll back locally: re-insert the `session` at its saved `index`, restore the
+    /// pin at `pinIndex` (nil if it wasn't pinned) and the prior `seenCount`, persist, and
+    /// surface the error. `profileName` + `searchQuery` are the list context the PATCH was
+    /// issued under — the row re-insert is dropped when the context changed mid-flight,
+    /// while the pin/seen restore always applies (see `rollBackFailedRemoval` for the rule).
+    case archiveFailed(
+      id: Session.ID, session: Session, index: Int, pinIndex: Int?, seenCount: Int?,
+      profileName: String?, searchQuery: String, error: RESTError
+    )
+    /// Ask to permanently delete a session (presents the confirmation dialog).
+    case deleteButtonTapped(id: Session.ID)
+    /// Delete RPC succeeded — clear the transient in-flight guard, emit
+    /// `Delegate.sessionDeleteSucceeded`, and cancel/restart any fetch that started
+    /// during the DELETE window (mirrors `archiveSucceeded`).
+    case deleteSucceeded(id: Session.ID)
+    /// Delete RPC failed. Clear the in-flight guard and roll back locally (same rollback
+    /// payload + same context rule as archive — see `rollBackFailedRemoval`). A definitive
+    /// 404/405 `error` additionally flips `deleteSupported` off SILENTLY (older agent —
+    /// no banner, mirror the capability flips); any other error surfaces the banner.
+    case deleteFailed(
+      id: Session.ID, session: Session, index: Int, pinIndex: Int?, seenCount: Int?,
+      profileName: String?, searchQuery: String, error: RESTError
+    )
+    /// The archived sheet's DELETE round-trip finished. The round-trip runs HERE, not in
+    /// the sheet — a presented child's effects are cancelled on dismissal, so a sheet-run
+    /// DELETE racing Done/swipe-down would be silently dropped after the cache wipe
+    /// already happened (see `ArchivedSessionsFeature.Delegate.deleted`). Success is
+    /// re-injected into the sheet while it still owns the delete, and the badge delegate
+    /// fires. `generation` is the sheet presentation the delete was initiated under
+    /// (`State.archivedSheetGeneration`) — the session id alone is ambiguous across a
+    /// dismiss-and-reopen, where a re-deleted id could pair with a STALE outcome.
+    case archivedDeleteSucceeded(id: Session.ID, generation: Int)
+    /// The archived sheet's DELETE failed: re-injected into the sheet while it still owns
+    /// the delete (rollback + capability verdict happen there); with the sheet gone — or
+    /// when `generation` shows the outcome belongs to a PREVIOUS presentation of the
+    /// sheet — the verdict/banner applies to the list so the outcome never vanishes.
+    case archivedDeleteFailed(
+      id: Session.ID, session: Session, index: Int, generation: Int, error: RESTError
+    )
+    /// Open the rename alert for a row: seeds `renameDraft` with the row's current title.
+    case renameButtonTapped(id: Session.ID)
+    /// Commit the rename: optimistically update the row's title and fire the REST PATCH.
+    case confirmRename
+    /// Rename PATCH succeeded — the optimistic value stands.
+    case renameSucceeded(id: Session.ID)
+    /// Rename PATCH failed — restore `previousTitle` and surface the error.
+    case renameFailed(id: Session.ID, previousTitle: String?, error: RESTError)
+    /// Dismiss the rename alert without applying changes.
+    case cancelRename
+    case confirmationDialog(PresentationAction<Dialog>)
+    case settings(PresentationAction<SettingsFeature.Action>)
+    /// Open the Archived sessions sheet (from the top-trailing menu).
+    case archivedButtonTapped
+    case archived(PresentationAction<ArchivedSessionsFeature.Action>)
+    // MARK: Profiles
+    /// Switch the active profile (persist, reset list UI, refetch the scoped session list).
+    case selectProfile(name: String)
+    /// Response from the `profiles.list` capability probe on `.task` (also fetches sessions).
+    case profilesResponse(Result<[Profile], RESTError>)
+    /// Refresh of the profile list WITHOUT a session fetch (after create/delete, paired with a
+    /// subsequent `selectProfile` that does the single scoped fetch).
+    case profilesRefreshed([Profile])
+    /// Open the Add-profile sheet.
+    case addProfileTapped
+    case addProfile(PresentationAction<AddProfileFeature.Action>)
+    /// Open the rename alert for a custom profile: seeds `profileRenameDraft` with its name.
+    case renameProfileTapped(name: String)
+    /// Commit the profile rename from the alert (sends the entered draft as `newName`).
+    case confirmRenameProfile
+    /// Dismiss the profile-rename alert without applying changes.
+    case cancelRenameProfile
+    /// Begin renaming a custom profile (opens the inline rename via the dialog/menu path).
+    case renameProfileButtonTapped(name: String, newName: String)
+    /// Rename PATCH succeeded — the optimistic profile name stands.
+    case renameProfileSucceeded
+    /// Rename PATCH failed — restore `previousProfiles` and surface the error.
+    case renameProfileFailed(previousProfiles: IdentifiedArrayOf<Profile>, previousSelected: String)
+    /// Ask to delete a custom profile (presents the confirmation dialog).
+    case deleteProfileButtonTapped(name: String)
+    /// Delete PATCH succeeded — remove the profile locally and, if it was active, re-home to
+    /// default and refetch sessions.
+    case deleteProfileSucceeded(name: String)
+    /// Delete failed — surface the error (no local state was changed yet).
+    case deleteProfileFailed
+    /// Event-driven working-glow patch from the open chat (routed by `AppFeature` from
+    /// `ChatFeature.Delegate.runningChanged`): set the row's `isActive` INSTANTLY so the glow
+    /// clears/lights the moment the agent stops/starts, rather than waiting for the next poll.
+    /// Always server-confirmed (the delegate only fires from `message.start`/`complete`/`error`
+    /// and the `session.resume` `running` flag) — a cached `running-guess` never reaches here,
+    /// so it can never start a glow on its own. The poll remains the backstop for not-open
+    /// sessions. A no-op for an unknown id (the session isn't in the current list).
+    case setSessionRunning(id: Session.ID, running: Bool)
+    /// The open chat archived or deleted this session from its own ⋯ menu and the server
+    /// acknowledged it. Drop the row and its device-local pin/seen entries (both keyed by
+    /// id, profile-agnostic), and restart a fetch in flight so it can't resurrect the row.
+    case sessionRemovedElsewhere(id: Session.ID)
+    // MARK: Cron jobs
+    /// Result of the `GET /api/cron/jobs` fetch (runs alongside every session load).
+    /// Success stores the jobs; a definitive `.notFound` flips `cronJobsSupported` off
+    /// (older agent → flat fallback, fetch skipped from then on); transient failures keep
+    /// the previous jobs so the section doesn't flap.
+    case cronJobsResponse(Result<[CronJob], RESTError>)
+    /// Toggle a job's inline run-peek (single-open: expanding one collapses another).
+    /// Expanding fetches the job's runs from `/runs`; collapsing cancels that fetch.
+    case cronJobTapped(id: String)
+    /// Result of the expanded job's `/runs` fetch. Dropped when `jobID` is no longer the
+    /// expanded job (a late response after a collapse or switch).
+    case cronRunsResponse(jobID: String, Result<[Session], RESTError>)
+    /// A run row under the expanded job was tapped: a session run (`isCron`) opens its chat;
+    /// a script-only `cron_output` row has no session and does nothing.
+    case cronRunTapped(id: Session.ID)
+    /// "Run now" on a job row — `POST /api/cron/jobs/{id}/trigger`.
+    case triggerCronJob(id: String)
+    /// Pause a job — `POST /api/cron/jobs/{id}/pause`.
+    case pauseCronJob(id: String)
+    /// Resume a paused job — `POST /api/cron/jobs/{id}/resume`.
+    case resumeCronJob(id: String)
+    /// "Delete" on a job row: raise the confirmation dialog (`Dialog.confirmDeleteCronJob`).
+    /// Confirming sends `DELETE /api/cron/jobs/{id}`.
+    case deleteCronJobTapped(id: String)
+    /// A cron action RPC finished: lift the in-flight guard; on success refetch from the
+    /// server (see `CronJobActionKind`); on failure surface the banner. No optimistic mutation — job
+    /// state is server-computed and the refetch/poll reconciles. A delete's success (or 404:
+    /// already gone) drops the job locally first so the row disappears at once.
+    case cronJobActionFinished(id: String, kind: CronJobActionKind, error: RESTError?)
+    // MARK: Push notifications
+    /// Kicks off contextual push setup once the list appears (right after login): first probe
+    /// the `hermes-push` plugin readiness, then branch on the result. Fired from `.task`.
+    case setupPush
+    /// Result of the plugin-readiness probe (`rest.pushPluginStatus`). `ready` → read the
+    /// notification permission (no prompt); `notReady` → set `pushAvailable=false` and show
+    /// the install card unless snoozed; `unknown` → leave capability as-is (don't nag).
+    case pushPluginStatusLoaded(PushPluginStatus)
+    /// The current notification permission, read once the plugin is ready. `authorized` /
+    /// `provisional` → silent register (and clear any snooze); `notDetermined` → the Turn on
+    /// card unless snoozed; `denied` → nothing.
+    case pushAuthorizationStatusLoaded(PushAuthorizationStatus)
+    /// Begin the permission-request + token-observe flow (only when the plugin is ready).
+    case requestPushAuthorization
+    /// The install card's "Ask my agent to install it" — open a new chat with the install
+    /// prompt pre-filled in the composer (bubbles up via the create delegate).
+    case pushCardAskAgentButtonTapped
+    /// The enable card's "Turn on" — the only path to the system permission prompt.
+    case pushCardEnableButtonTapped
+    /// Either card's "Not now" / "Later" — hide + snooze (Fibonacci backoff on the count).
+    case pushCardNotNowButtonTapped
+    /// The tips row's "Hide" — hide the row and persist the choice until the next logout.
+    case onboardingTipsHideButtonTapped
+    /// A device token arrived from `PushClient.register()` (initial registration OR an OS
+    /// rotation) — (re-)register it with the agent. Carries the lowercase-hex token.
+    case pushTokenReceived(String)
+    /// `rest.registerPush` succeeded → push is available.
+    case pushRegistered
+    /// `rest.registerPush` failed; a `.notFound` flips `pushAvailable` off (plugin not installed).
+    case pushRegisterFailed(RESTError)
+    case delegate(Delegate)
+
+    @CasePathable
+    public enum Dialog: Equatable {
+      case confirmArchive(id: Session.ID)
+      case confirmDelete(id: Session.ID)
+      case confirmDeleteProfile(name: String)
+      case confirmDeleteCronJob(id: String)
+    }
+
+    /// Which cron job action finished — decides the post-success reconcile.
+    public enum CronJobActionKind: Equatable, Sendable {
+      /// Run now: full load (a new run session) plus the expanded job's runs.
+      case trigger
+      /// Pause/resume: jobs-only refetch.
+      case pauseResume
+      /// Delete: drop the job (404 = already gone = success), supersede a pending list load
+      /// (which refetches jobs), else a jobs-only refetch.
+      case delete
+    }
+
+    @CasePathable
+    public enum Delegate {
+      case openSession(Session)
+      /// Open a NEW chat. `initialComposerText` (when non-nil) is pre-filled in the composer
+      /// but NOT sent — used by the push "Ask agent to install" flow so the user reviews + sends.
+      case createSession(initialComposerText: String?)
+      case disconnect
+      /// The user confirmed archiving this session (the optimistic removal + PATCH follow).
+      /// Emitted FIRST so the parent can tear the live-chat slot down when it matches — a
+      /// detached slot's socket must not keep streaming into a now-archived session.
+      case sessionArchived(id: Session.ID)
+      /// The user confirmed permanently deleting this session (the optimistic removal +
+      /// DELETE follow). Emitted FIRST, like `sessionArchived`, so the parent tears the
+      /// live-chat slot down when it matches AND wipes the session's cached snapshot +
+      /// turn anchor — a deleted session must not repaint from cache.
+      case sessionDeleted(id: Session.ID)
+      /// The server CONFIRMED a permanent delete (main list or archived sheet). Distinct
+      /// from `sessionDeleted` (optimistic, at initiation): cleanup that must NOT survive
+      /// a failed delete keys off this one — `AppFeature` drops the session's
+      /// pending-approval badge entry here, because after a failed delete the approval is
+      /// still pending on the server and nothing short of a fresh push would repopulate
+      /// the entry.
+      case sessionDeleteSucceeded(id: Session.ID)
+      /// The Settings "Live Activity" toggle changed (Settings persisted it) — forwarded so
+      /// `AppFeature`, which owns the activity, ends or starts it (#138).
+      case liveActivityToggled(Bool)
+      /// The Settings "Show session titles" toggle changed (Settings persisted it).
+      case liveActivityShowsTitlesToggled(Bool)
+    }
+  }
+
+  /// The inline push card's variant (`State.pushCard`).
+  public enum PushCard: Equatable, Sendable {
+    /// The plugin is ready and permission was never asked: preview + "Turn on".
+    case enableNotifications
+    /// The plugin isn't installed / enabled: "Ask my agent to install it".
+    case installPlugin
+  }
+
+  /// One card in the dismissible tips row (`State.onboardingTips`). The copy lives in the view.
+  public enum OnboardingTip: Equatable, Sendable {
+    /// Switch profiles from the pill at the top (only with the profiles API).
+    case profiles
+    /// Swipe a session to archive/delete or rename it.
+    case swipeActions
+    /// Dictate with the mic in a chat.
+    case voice
+  }
+
+  // One id for BOTH the list fetch and the search fetch: any new fetch (list refresh, poll,
+  // or search) cancels the previous in-flight one, so a late list response can't overwrite
+  // active search results (and vice versa). `poll` is the separate timer loop. `cronRuns` is
+  // the expanded job's `/runs` fetch — its own id so it never cancels (or is cancelled by)
+  // the list load it rides alongside. `pushTokens` covers the whole push chain (plugin probe,
+  // permission read, token stream) on purpose: a Turn on tap during the permission read
+  // cancels it, so a stale `.notDetermined` can't bring the card back. `profilesProbe` is
+  // the `.task` profiles probe, NEVER `fetch`: a list load (the 10 s poll, pull-to-refresh,
+  // a search keystroke, archive/rename/delete) landing before a slow `/api/profiles` would
+  // cancel it silently, and only the next `.task` re-probes — meanwhile the seeded
+  // `profilesSupported` showed a profile menu with no profiles in it.
+  private enum CancelID { case fetch, poll, profilesProbe, pushTokens, copyIDToast, cronRuns }
+
+  /// How often the list auto-refreshes while visible, to keep `isActive` (working glow) fresh.
+  private static let pollInterval: Duration = .seconds(10)
+
+  /// Rows per slice of a list load: interactive sessions, then cron runs (the desktop's
+  /// `CRON_SECTION_LIMIT`), fetched as independent source-scoped pages.
+  static let interactivePageSize = 50
+  static let cronPageSize = 50
+
+  /// How long a copy confirmation (the "Session ID copied" toast) stays up before
+  /// auto-dismissing. Same name/value in every feature that confirms a copy.
+  static let copiedFeedbackDuration: Duration = .seconds(1.5)
+
+  @Dependency(\.hermesREST) var rest
+  @Dependency(\.hermesProfiles) var profiles
+  @Dependency(\.continuousClock) var clock
+  @Dependency(\.date.now) var now
+  @Dependency(\.sessionListCalendar) var calendar
+  @Dependency(\.preferences) var preferences
+  @Dependency(\.push) var push
+  @Dependency(\.pasteboard) var pasteboard
+
+  public init() {}
+
+  public var body: some ReducerOf<Self> {
+    BindingReducer()
+    Reduce { state, action in
+      switch action {
+      case .task:
+        // Refresh "now", reload persisted prefs (incl. the device-local selected profile),
+        // probe the profiles capability, and start the auto-poll loop.
+        reloadPrefs(&state)
+        state.selectedProfileName = Self.State.persistedProfileName(preferences)
+        state.isLoading = true
+        return .merge(
+          .run { [profiles, connection = state.connection] send in
+            do {
+              let result = try await profiles.list(connection)
+              await send(.profilesResponse(.success(result)))
+            } catch let error as RESTError {
+              await send(.profilesResponse(.failure(error)))
+            } catch {
+              await send(.profilesResponse(.failure(.unreachable)))
+            }
+          }
+          .cancellable(id: CancelID.profilesProbe, cancelInFlight: true),
+          .run { [clock, interval = Self.pollInterval] send in
+            while true {
+              try await clock.sleep(for: interval)
+              await send(.pollTick)
+            }
+          }
+          .cancellable(id: CancelID.poll, cancelInFlight: true),
+          // Contextual push setup now that we're past login: decide which push card (if any)
+          // to show, or register silently when permission was already granted. The system
+          // permission prompt itself waits for the card's Turn on tap.
+          .send(.setupPush)
+        )
+
+      case .onDisappear:
+        // Stop the poll (and any in-flight fetch / search debounce) when the list goes away.
+        return .merge(
+          .cancel(id: CancelID.poll),
+          .cancel(id: CancelID.profilesProbe),
+          .cancel(id: CancelID.fetch),
+          .cancel(id: CancelID.pushTokens),
+          .cancel(id: CancelID.cronRuns)
+        )
+
+      case .pollTick:
+        // Skip the auto-refresh while searching (don't fight the user's query), while an
+        // archive or delete is in flight (don't churn / risk resurrecting the removed row),
+        // or while a rename PATCH is in flight (a fetch could clobber the optimistic title
+        // with the old one).
+        guard !state.isSearching, state.archivingIDs.isEmpty, state.deletingIDs.isEmpty,
+          state.renamingInFlightIDs.isEmpty
+        else { return .none }
+        return .send(.pulledToRefresh)
+
+      case .pulledToRefresh:
+        // A plain reload — does NOT (re)start the poll loop.
+        return load(&state)
+
+      case let .sessionRemovedElsewhere(id):
+        state.sessions.remove(id: id)
+        state.pinnedIDs.removeAll { $0 == id }
+        state.seenCounts[id] = nil
+        // Persist BEFORE the restart: `cancelOrRestartFetch` may reload through `load`,
+        // whose `reloadPrefs` would read the OLD pins/seen back into state (and later pin
+        // or read writes would persist them again). Synchronous, like the rollback rule.
+        preferences.savePinnedIDs(state.pinnedIDs)
+        preferences.saveSeenCounts(state.seenCounts)
+        return cancelOrRestartFetch(&state)
+
+      case let .setSessionRunning(id, running):
+        // Patch the in-memory row's working flag (drives the glow) the instant the open chat
+        // tells us this session's authoritative running state changed. No-op if the session
+        // isn't in the current list (e.g. archived/filtered) — the poll handles those. The
+        // unfiltered `statusSessions` gets the same patch on its own: a search can hide the
+        // row from `sessions` while the widgets still show it.
+        if state.sessions[id: id]?.isActive != running {
+          state.sessions[id: id]?.isActive = running
+        }
+        if state.statusSessions?[id: id]?.isActive != running {
+          state.statusSessions?[id: id]?.isActive = running
+        }
+        return .none
+
+      case let .cronJobsResponse(.success(jobs)):
+        if state.awaitsCronJobs { state.isLoading = false }
+        state.cronJobsSupported = true
+        // Defensive uniquing (first wins): the unscoped fetch aggregates every profile's
+        // jobs file, so never crash on a duplicated id (e.g. a copied profile home).
+        state.cronJobs = IdentifiedArray(jobs, uniquingIDsWith: { first, _ in first })
+        // A job removed elsewhere (desktop, CLI, a one-shot finishing) takes its expansion
+        // with it, so nothing keeps polling its runs.
+        if let expanded = state.expandedCronJobID, state.cronJobs[id: expanded] == nil {
+          return collapseExpandedCronJob(&state)
+        }
+        return .none
+
+      case let .cronJobsResponse(.failure(error)):
+        // A definitive 404 → old agent without the cron API. Fall back to the flat section
+        // and stop fetching. Anything transient keeps the previous jobs (no flapping).
+        if state.awaitsCronJobs { state.isLoading = false }
+        if error == .notFound {
+          state.cronJobsSupported = false
+          state.cronJobs = []
+          return collapseExpandedCronJob(&state)
+        }
+        return .none
+
+      case let .cronJobTapped(id):
+        // Tapping the open job collapses it; any other job becomes the single open one.
+        // Either way the runs slot starts empty — never show one job's runs under another.
+        guard state.expandedCronJobID != id else { return collapseExpandedCronJob(&state) }
+        state.expandedCronJobID = id
+        state.expandedCronRuns = nil
+        state.expandedCronRunsFailed = false
+        // `cancelInFlight` drops the previous job's fetch on a switch.
+        return fetchExpandedCronRuns(state)
+
+      case let .cronRunsResponse(jobID, result):
+        // A late response for a job that is no longer expanded never lands.
+        guard jobID == state.expandedCronJobID else { return .none }
+        switch result {
+        case let .success(runs):
+          state.expandedCronRuns = runs
+          state.expandedCronRunsFailed = false
+        case .failure:
+          // Only a FIRST load failure shows "Couldn't load runs"; a failed refresh keeps
+          // the runs already on screen (the next poll retries).
+          if state.expandedCronRuns == nil { state.expandedCronRunsFailed = true }
+        }
+        return .none
+
+      case let .cronRunTapped(id):
+        // Looked up in the runs slot, not `state.sessions`: an older run may be outside the
+        // list's 50-row cron slice. Script-only `cron_output` rows have no session to open.
+        guard let run = state.expandedCronRuns?.first(where: { $0.id == id }), run.isCron
+        else { return .none }
+        return .merge(
+          markLocallyRead(id, state: &state),
+          .send(.delegate(.openSession(run)))
+        )
+
+      case let .triggerCronJob(id):
+        return performCronAction(&state, id: id, kind: .trigger) { rest, conn, jobID, profile in
+          try await rest.triggerCronJob(conn, jobID, profile)
+        }
+
+      case let .pauseCronJob(id):
+        return performCronAction(&state, id: id, kind: .pauseResume) { rest, conn, jobID, profile in
+          try await rest.pauseCronJob(conn, jobID, profile)
+        }
+
+      case let .resumeCronJob(id):
+        return performCronAction(&state, id: id, kind: .pauseResume) { rest, conn, jobID, profile in
+          try await rest.resumeCronJob(conn, jobID, profile)
+        }
+
+      case let .deleteCronJobTapped(id):
+        // The title names the job, so a row whose job vanished (poll, profile switch) since
+        // the menu rendered has nothing to confirm.
+        guard state.cronJobsSupported, let job = state.cronJobs[id: id] else { return .none }
+        state.confirmationDialog = ConfirmationDialogState {
+          TextState("Delete “\(job.title)”?")
+        } actions: {
+          ButtonState(role: .destructive, action: .confirmDeleteCronJob(id: id)) {
+            TextState("Delete")
+          }
+          ButtonState(role: .cancel) {
+            TextState("Cancel")
+          }
+        } message: {
+          TextState(
+            "The job and its schedule are removed from the agent. Its past runs are kept on the server but won’t be listed here."
+          )
+        }
+        return .none
+
+      case let .confirmationDialog(.presented(.confirmDeleteCronJob(id))):
+        // Not optimistic: the row stays until the server confirms (`.cronJobActionFinished`).
+        guard state.cronJobsSupported else { return .none }
+        // A confirmed destructive action is never dropped silently by the in-flight guard.
+        guard !state.cronActionInFlightIDs.contains(id) else {
+          state.loadError = Self.cronJobBusyMessage
+          return .none
+        }
+        return performCronAction(&state, id: id, kind: .delete) { rest, conn, jobID, profile in
+          try await rest.deleteCronJob(conn, jobID, profile)
+        }
+
+      case let .cronJobActionFinished(id, kind, error):
+        state.cronActionInFlightIDs.remove(id)
+        // A delete's 404 means the job is already gone — the outcome the user asked for.
+        if let error, !(kind == .delete && error == .notFound) {
+          // Surface the server's copy verbatim (e.g. a 400 detail) via the existing banner.
+          state.loadError = error.message
+          return .none
+        }
+        // Success → reconcile from the server. A trigger just spawned a run session, so do
+        // the full load (sessions + jobs + the expanded job's runs); pause/resume only
+        // changed the job, so a jobs-only refetch avoids churning the list.
+        switch kind {
+        case .trigger:
+          return load(&state)
+        case .pauseResume:
+          return refetchCronJobs(state)
+        case .delete:
+          // Drop the row now rather than waiting on the refetch; collapsing a deleted
+          // expanded job also cancels its runs fetch.
+          state.cronJobs.remove(id: id)
+          let collapse = state.expandedCronJobID == id ? collapseExpandedCronJob(&state) : .none
+          // A list load already in flight may carry a pre-DELETE jobs response that would
+          // bring the row back: supersede it. Decided BEFORE `cancelOrRestartFetch`, which
+          // restarts exactly when this holds; the restarted load refetches the jobs itself
+          // (a search load skips them, and the search's clear reloads them).
+          let restartsLoad = state.isLoading || state.isSearching
+          let fetch = cancelOrRestartFetch(&state)
+          return .merge(collapse, fetch, restartsLoad ? .none : refetchCronJobs(state))
+        }
+
+      case .setupPush:
+        // Push onboarding (after login, on the list). FIRST probe whether the `hermes-push`
+        // plugin is installed + enabled (a REST-only check that works without the WS); the
+        // result decides which card to show, whether to register silently, or nothing.
+        return .run { [rest, connection = state.connection] send in
+          let status = (try? await rest.pushPluginStatus(connection)) ?? .unknown
+          await send(.pushPluginStatusLoaded(status))
+        }
+        .cancellable(id: CancelID.pushTokens, cancelInFlight: true)
+
+      case let .pushPluginStatusLoaded(status):
+        switch status {
+        case .ready:
+          // Plugin is live → push is available. Read the permission WITHOUT prompting: it
+          // decides between a silent register and the Turn on card. An install card from an
+          // earlier probe is stale now; a Turn on card stays until that read decides.
+          state.pushAvailable = true
+          if state.pushCard == .installPlugin { state.pushCard = nil }
+          return .run { [push] send in
+            await send(.pushAuthorizationStatusLoaded(push.authorizationStatus()))
+          }
+          .cancellable(id: CancelID.pushTokens, cancelInFlight: true)
+        case .notReady:
+          // Plugin absent / disabled → push isn't available. Show the install card unless the
+          // prompt is currently snoozed (Fibonacci backoff from prior "Later" taps).
+          state.pushAvailable = false
+          state.pushCard = isPushPromptSnoozed() ? nil : .installPlugin
+          return .none
+        case .unknown:
+          // Endpoint 404 / network error — can't tell. Don't nag; leave capability as-is.
+          return .none
+        }
+
+      case let .pushAuthorizationStatusLoaded(status):
+        switch status {
+        case .authorized, .provisional:
+          // Already granted → register silently (no prompt: `requestAuthorization` resolves
+          // at once). Clear any prior snooze so a later uninstall re-prompts fresh.
+          state.pushCard = nil
+          preferences.clearPushPromptSnooze()
+          return .send(.requestPushAuthorization)
+        case .notDetermined:
+          // Never asked → offer the Turn on card unless the user snoozed it.
+          state.pushCard = isPushPromptSnoozed() ? nil : .enableNotifications
+          return .none
+        case .denied:
+          // The user said no in the system prompt (or Settings) — don't nag; Settings has the
+          // toggle.
+          state.pushCard = nil
+          return .none
+        }
+
+      case .requestPushAuthorization:
+        // Contextual permission request. If granted, observe the device-token stream as a
+        // long-running cancellable effect — each emitted token (the first registration and any
+        // OS rotation) drives a (re-)register. If denied we do nothing further; the toggle in
+        // Settings can re-prompt later.
+        return .run { [push] send in
+          guard await push.requestAuthorization() else { return }
+          for await token in push.register() {
+            await send(.pushTokenReceived(token))
+          }
+        }
+        .cancellable(id: CancelID.pushTokens, cancelInFlight: true)
+
+      case .pushCardAskAgentButtonTapped:
+        // Hide the card and open a new chat with the install prompt pre-filled (NOT sent —
+        // the user reviews and sends). Bubbles up via the create delegate, carrying the text.
+        state.pushCard = nil
+        return .send(.delegate(.createSession(initialComposerText: PushSetup.installPrompt)))
+
+      case .pushCardEnableButtonTapped:
+        // The user opted in → the system prompt, then (if granted) the token register.
+        state.pushCard = nil
+        return .send(.requestPushAuthorization)
+
+      case .pushCardNotNowButtonTapped:
+        // Hide + snooze: bump the count and push the next prompt out by the matching
+        // Fibonacci interval, persisting both so it survives relaunch. Both card variants
+        // share the one snooze.
+        state.pushCard = nil
+        let count = (preferences.loadPushPromptSnooze()?.count ?? 0) + 1
+        let until = now.addingTimeInterval(Double(pushPromptSnoozeDays(laterCount: count)) * 86_400)
+        preferences.savePushPromptSnooze(count, until)
+        return .none
+
+      case .onboardingTipsHideButtonTapped:
+        state.showsOnboardingTips = false
+        preferences.saveOnboardingTipsDismissed(true)
+        return .none
+
+      case let .pushTokenReceived(token):
+        // (Re-)register this device token with the agent's push plugin, threading the
+        // compile-time APNs env + app version. Persist the token (non-secret) so logout can
+        // unregister with it even when the live stream isn't producing.
+        preferences.savePushDeviceToken(token)
+        return .run { [rest, push, connection = state.connection] send in
+          let env = PushClient.apnsEnv
+          let version = push.appVersion()
+          do {
+            try await rest.registerPush(connection, token, env, version)
+            await send(.pushRegistered)
+          } catch let error as RESTError {
+            await send(.pushRegisterFailed(error))
+          } catch {
+            await send(.pushRegisterFailed(.unreachable))
+          }
+        }
+
+      case .pushRegistered:
+        // Plugin present → push is available. The app does not sign pushes (the plugin signs
+        // with a shared secret), so there's nothing to persist on success.
+        state.pushAvailable = true
+        return .none
+
+      case let .pushRegisterFailed(error):
+        // A definitive 404 means the plugin isn't installed — capability-gate the push UI off.
+        // Other (transient) failures leave `pushAvailable` as-is so we retry on the next token.
+        if error == .notFound {
+          state.pushAvailable = false
+        }
+        return .none
+
+      case .binding(\.searchQuery):
+        // Only the searchQuery binding drives the fetch; other bound fields (renameDraft)
+        // must NOT trigger a search. A CLEARED query (trimmed-empty — the field's
+        // clear/cancel, or backspacing out the text) reloads the normal list IMMEDIATELY
+        // via `load`: there is no keystroke burst to debounce on the way out, and `load`
+        // raises `isLoading` — which is what lets `cancelOrRestartFetch` see this fetch
+        // as pending. The debounced branch below sets no flag, and with the query already
+        // empty `isSearching` no longer covers the window, so a mutation success landing
+        // mid-window would otherwise bare-cancel the pending reload and strand the stale
+        // search results until the next poll.
+        guard state.isSearching else { return load(&state) }
+        // Clear the previous request's error now, not on response: a mutation may fail
+        // while this search is in flight, and its banner must survive the response.
+        state.loadError = nil
+        return .run { [
+          rest, profiles, connection = state.connection, query = state.searchQuery, clock,
+          profile = state.scopedProfileName
+        ] send in
+          try await clock.sleep(for: .milliseconds(300))
+          await send(fetchSessions(
+            rest: rest, profiles: profiles, connection: connection, query: query, profile: profile
+          ))
+        }
+        // Shared `fetch` id: cancels any in-flight list load so a late list response can't
+        // overwrite these search results.
+        .cancellable(id: CancelID.fetch, cancelInFlight: true)
+
+      case .binding:
+        // Other bindings (e.g. renameDraft) are pure state edits — no side effects.
+        return .none
+
+      case let .sessionsResponse(result):
+        let reconcilePins = state.profilesSupported && !state.isSearching
+        return applySessionsResponse(result, state: &state, reconcilePins: reconcilePins)
+
+      case let .sessionTapped(id):
+        guard let session = state.sessions[id: id] else { return .none }
+        return .merge(
+          markLocallyRead(id, state: &state),
+          .send(.delegate(.openSession(session)))
+        )
+
+      case let .pinSession(id):
+        return setPinned(&state, id: id, pinned: true)
+
+      case let .unpinSession(id):
+        return setPinned(&state, id: id, pinned: false)
+
+      case let .pinMigrationFinished(server, id, profileName, error):
+        guard server == state.pinMigrationServerID,
+          let mutation = state.pinMutations[id], mutation.profileName == profileName,
+          preferences.loadPinMigration(server)?.pendingIDs.contains(id) == true
+        else { return .none }
+        state.pinMutations[id] = nil
+        // Failed automatic writes remain pending and silent until the next capable list.
+        guard error == nil else { return .none }
+        retireMigrationPin(server: server, id: id)
+        return cancelOrRestartFetch(&state)
+
+      case let .pinWriteFinished(id, profileName, error):
+        guard let mutation = state.pinMutations[id], mutation.profileName == profileName
+        else { return .none }
+        state.pinMutations[id] = nil
+        if let error {
+          state.pinnedIDs.removeAll { $0 == id }
+          if let index = mutation.previousIndex {
+            state.pinnedIDs.insert(id, at: min(index, state.pinnedIDs.count))
+          }
+          preferences.savePinnedIDs(state.pinnedIDs)
+          let fetch = cancelOrRestartFetch(&state)
+          // A fenced-write refusal reads as a sentence; anything else keeps the server's copy.
+          state.loadError = error.sessionMutationRefusal == nil
+            ? error.message : error.sessionMutationBanner("Couldn’t update the pin.")
+          return fetch
+        }
+        retireMigrationPin(server: state.pinMigrationServerID, id: id)
+        return cancelOrRestartFetch(&state)
+
+      case let .copyIDButtonTapped(id):
+        state.copiedIDToastToken = (state.copiedIDToastToken ?? 0) + 1
+        // Copy now; hide the confirmation after a beat. A second copy while the toast is
+        // up restarts the dwell (cancelInFlight) so the latest copy owns the countdown.
+        return .merge(
+          .run { [pasteboard] _ in pasteboard.copy(id) },
+          .run { [clock] send in
+            try await clock.sleep(for: Self.copiedFeedbackDuration)
+            await send(.copiedIDToastExpired)
+          }
+          .cancellable(id: CancelID.copyIDToast, cancelInFlight: true)
+        )
+
+      case .copiedIDToastExpired:
+        state.copiedIDToastToken = nil
+        return .none
+
+      case let .selectTab(tab):
+        if tab == .settings {
+          state.selectedTab = .settings
+          // Re-tapping the open tab keeps its state (and any sub-screen) as is.
+          if state.settings == nil {
+            seedSettings(&state)
+          }
+          return .none
+        }
+        state.closeSettingsTab()
+        state.selectedTab = tab
+        // Runs aren't polled while the Cron Jobs tab is hidden (see `load`): catch up on return.
+        return state.effectiveTab == .cron ? fetchExpandedCronRuns(state) : .none
+
+      case .searchButtonTapped:
+        state.isSearchPresented = true
+        return .none
+
+      case .searchCloseTapped:
+        state.isSearchPresented = false
+        guard !state.searchQuery.isEmpty else { return .none }
+        // Leaving with a query: drop it and reload the normal list right away — the same
+        // immediate reload a cleared query gets through the binding.
+        let wasSearching = state.isSearching
+        state.searchQuery = ""
+        return wasSearching ? load(&state) : .none
+
+      case let .archiveButtonTapped(id):
+        state.confirmationDialog = ConfirmationDialogState {
+          TextState("Archive session?")
+        } actions: {
+          ButtonState(role: .destructive, action: .confirmArchive(id: id)) {
+            TextState("Archive")
+          }
+          ButtonState(role: .cancel) {
+            TextState("Cancel")
+          }
+        } message: {
+          TextState("This hides the session from the list. You can restore it from the server.")
+        }
+        return .none
+
+      case let .confirmationDialog(.presented(.confirmArchive(id))):
+        guard let index = state.sessions.index(id: id) else { return .none }
+        // Capture rollback info BEFORE mutating: the session + its list index, the pin position
+        // (if pinned) and prior seen baseline — so a failed RPC can restore everything locally.
+        let session = state.sessions[index]
+        let pinIndex = state.pinMutations[id] == nil ? state.pinnedIDs.firstIndex(of: id) : nil
+        let seenCount = state.seenCounts[id]
+        // Optimistic removal: drop from the list + clear its pin/seen entries, persist,
+        // then run the RPC. On failure we re-insert and surface the error.
+        state.sessions.remove(id: id)
+        if state.pinMutations[id] == nil { state.pinnedIDs.removeAll { $0 == id } }
+        state.seenCounts[id] = nil
+        // Mark as in-flight so a fetch landing during the PATCH window filters it out and the
+        // poll skips — closing the window where a reload could resurrect the removed row.
+        state.archivingIDs.insert(id)
+        let pinnedIDs = state.pinnedIDs
+        let seenCounts = state.seenCounts
+        // Cancel any in-flight fetch (list load OR search) too: one started before this
+        // archive could land afterward and resurrect the row we just optimistically removed.
+        let archiveProfile = state.scopedProfileName
+        let archiveQuery = state.searchQuery
+        return .concatenate(
+          // Tell the parent FIRST (before the PATCH runs) so it can tear the live-chat slot
+          // down when this is the slot's session — the (possibly detached) socket must not
+          // keep streaming into a now-archived session.
+          .send(.delegate(.sessionArchived(id: id))),
+          .merge(
+            .cancel(id: CancelID.fetch),
+            .run { [rest, preferences, connection = state.connection] send in
+              preferences.savePinnedIDs(pinnedIDs)
+              preferences.saveSeenCounts(seenCounts)
+              do {
+                try await rest.archive(connection, id, true, archiveProfile)
+                await send(.archiveSucceeded(id: id))
+              } catch {
+                await send(.archiveFailed(
+                  id: id, session: session, index: index, pinIndex: pinIndex,
+                  seenCount: seenCount, profileName: archiveProfile, searchQuery: archiveQuery,
+                  error: asRESTError(error)
+                ))
+              }
+            }
+          )
+        )
+
+      case let .deleteButtonTapped(id):
+        // Mirror of the archived sheet's guard: the view already hides Delete affordances
+        // when the capability is off, but a context menu rendered before the flag flipped
+        // can still fire — refuse rather than round-trip a doomed DELETE.
+        guard state.deleteSupported else { return .none }
+        state.confirmationDialog = ConfirmationDialogState {
+          TextState("Delete session?")
+        } actions: {
+          ButtonState(role: .destructive, action: .confirmDelete(id: id)) {
+            TextState("Delete")
+          }
+          ButtonState(role: .cancel) {
+            TextState("Cancel")
+          }
+        } message: {
+          TextState("This permanently deletes the session and its history.")
+        }
+        return .none
+
+      case let .confirmationDialog(.presented(.confirmDelete(id))):
+        // Same capability guard as `deleteButtonTapped` — the flag can flip (e.g. mirrored
+        // from the archived sheet) while this dialog is already up.
+        guard state.deleteSupported else { return .none }
+        guard let index = state.sessions.index(id: id) else { return .none }
+        // Mirror of `.confirmArchive`: capture rollback info BEFORE mutating (session + list
+        // index + pin position + seen baseline), then optimistically remove + persist and run
+        // the DELETE. On failure everything is restored locally.
+        let session = state.sessions[index]
+        let pinIndex = state.pinMutations[id] == nil ? state.pinnedIDs.firstIndex(of: id) : nil
+        let seenCount = state.seenCounts[id]
+        state.sessions.remove(id: id)
+        if state.pinMutations[id] == nil { state.pinnedIDs.removeAll { $0 == id } }
+        state.seenCounts[id] = nil
+        // In-flight guard: a fetch landing during the DELETE window filters this id out and
+        // the poll skips — closing the window where a reload could resurrect the removed row.
+        state.deletingIDs.insert(id)
+        let pinnedIDs = state.pinnedIDs
+        let seenCounts = state.seenCounts
+        let deleteProfile = state.scopedProfileName
+        let deleteQuery = state.searchQuery
+        return .concatenate(
+          // Tell the parent FIRST (before the DELETE runs) so it can tear the live-chat slot
+          // down when this is the slot's session and wipe the cached snapshot — the socket
+          // must not keep streaming into (and the cache must not repaint) a deleted session.
+          .send(.delegate(.sessionDeleted(id: id))),
+          .merge(
+            // Cancel any in-flight fetch (list load OR search): one started before this
+            // delete could land afterward and resurrect the row we just removed.
+            .cancel(id: CancelID.fetch),
+            .run { [rest, preferences, connection = state.connection] send in
+              preferences.savePinnedIDs(pinnedIDs)
+              preferences.saveSeenCounts(seenCounts)
+              do {
+                try await rest.deleteSession(connection, id, deleteProfile)
+                await send(.deleteSucceeded(id: id))
+              } catch {
+                await send(.deleteFailed(
+                  id: id, session: session, index: index, pinIndex: pinIndex,
+                  seenCount: seenCount, profileName: deleteProfile, searchQuery: deleteQuery,
+                  error: asRESTError(error)
+                ))
+              }
+            }
+          )
+        )
+
+      case let .deleteSucceeded(id):
+        finishRemovalPins(&state, id: id)
+        // DELETE landed (an `already_absent` body is success by contract) — clear the
+        // transient guard so the poll resumes, and cancel/restart any fetch that started
+        // during the window (see `cancelOrRestartFetch`): with the guard now gone, its
+        // stale response could resurrect the row. The badge delegate fires on CONFIRMED
+        // deletes only — see `Delegate.sessionDeleteSucceeded`.
+        state.deletingIDs.remove(id)
+        return .merge(
+          .send(.delegate(.sessionDeleteSucceeded(id: id))),
+          cancelOrRestartFetch(&state)
+        )
+
+      case let .deleteFailed(id, session, index, pinIndex, seenCount, profileName, searchQuery, error):
+        // The delete didn't take — the server still has the session. Lift the guard and
+        // roll back (rollback rule: `rollBackFailedRemoval`). A missing-endpoint verdict
+        // (`isMissingEndpointVerdict`) → flip the capability off SILENTLY, no banner,
+        // like the other capability flips (the flag is server-wide, so it applies
+        // whatever the context). Anything else surfaces the banner.
+        state.deletingIDs.remove(id)
+        rollBackFailedRemoval(
+          &state, id: id, session: session, index: index, pinIndex: pinIndex,
+          seenCount: seenCount, profileName: profileName, searchQuery: searchQuery
+        )
+        if error.isMissingEndpointVerdict {
+          state.deleteSupported = false
+        } else {
+          state.loadError = error.sessionMutationBanner("Couldn’t delete the session.")
+        }
+        return .none
+
+      case let .confirmationDialog(.presented(.confirmDeleteProfile(name))):
+        guard let profile = state.profiles[id: name], !profile.isDefault else { return .none }
+        return .run { [profiles, connection = state.connection] send in
+          do {
+            try await profiles.delete(connection, name)
+            await send(.deleteProfileSucceeded(name: name))
+          } catch {
+            await send(.deleteProfileFailed)
+          }
+        }
+
+      case .confirmationDialog:
+        return .none
+
+      case let .archiveSucceeded(id):
+        finishRemovalPins(&state, id: id)
+        // PATCH landed — clear the transient guard so the poll resumes. Cancel/restart any
+        // fetch that started during the PATCH window (see `cancelOrRestartFetch`): with
+        // the guard now gone, its (stale) response could otherwise resurrect the archived
+        // row. Future authoritative fetches exclude archived sessions server-side
+        // (`archived=exclude`), so no permanent filter is needed.
+        state.archivingIDs.remove(id)
+        return cancelOrRestartFetch(&state)
+
+      case let .archiveFailed(id, session, index, pinIndex, seenCount, profileName, searchQuery, error):
+        // The archive didn't take — the server still has the session. Lift the in-flight
+        // guard, roll back (rollback rule: `rollBackFailedRemoval`), and surface the error.
+        state.archivingIDs.remove(id)
+        rollBackFailedRemoval(
+          &state, id: id, session: session, index: index, pinIndex: pinIndex,
+          seenCount: seenCount, profileName: profileName, searchQuery: searchQuery
+        )
+        state.loadError = error.sessionMutationBanner("Couldn’t archive the session.")
+        return .none
+
+      case let .renameButtonTapped(id):
+        guard let session = state.sessions[id: id] else { return .none }
+        state.renamingID = id
+        state.renameDraft = session.title ?? ""
+        return .none
+
+      case .confirmRename:
+        guard let id = state.renamingID, let session = state.sessions[id: id] else {
+          state.renamingID = nil
+          state.renameDraft = ""
+          return .none
+        }
+        // Capture the previous title for rollback, then optimistically apply the trimmed draft
+        // (an empty draft clears the title, mirroring the server's null/empty behaviour).
+        let previousTitle = session.title
+        let trimmed = state.renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        state.sessions[id: id]?.title = trimmed.isEmpty ? nil : trimmed
+        state.renamingID = nil
+        state.renameDraft = ""
+        // Mark as in-flight (poll skips while set) and cancel any in-flight fetch — one started
+        // before this PATCH could land mid-window and clobber the optimistic title with the
+        // server's old one. Mirrors archive's protection.
+        state.renamingInFlightIDs.insert(id)
+        let renameProfile = state.scopedProfileName
+        return .merge(
+          .cancel(id: CancelID.fetch),
+          .run { [rest, connection = state.connection] send in
+            do {
+              try await rest.rename(connection, id, trimmed, renameProfile)
+              await send(.renameSucceeded(id: id))
+            } catch {
+              await send(.renameFailed(
+                id: id, previousTitle: previousTitle, error: asRESTError(error)
+              ))
+            }
+          }
+        )
+
+      case let .renameSucceeded(id):
+        // PATCH landed — the optimistic title stands; lift the in-flight guard so the poll
+        // resumes. Cancel/restart any fetch that started during the PATCH window (see
+        // `cancelOrRestartFetch`): with the guard now gone, its (stale) response could
+        // otherwise clobber the optimistic title with the server's pre-rename value.
+        // Mirrors archiveSucceeded's protection.
+        state.renamingInFlightIDs.remove(id)
+        return cancelOrRestartFetch(&state)
+
+      case let .renameFailed(id, previousTitle, error):
+        // The rename didn't take (e.g. a 400 for an over-long/duplicate title) — lift the guard,
+        // restore the previous title locally, and surface the error.
+        state.renamingInFlightIDs.remove(id)
+        state.sessions[id: id]?.title = previousTitle
+        state.loadError = error.sessionMutationBanner("Couldn’t rename the session.")
+        return .none
+
+      case .cancelRename:
+        state.renamingID = nil
+        state.renameDraft = ""
+        return .none
+
+      case .newSessionButtonTapped:
+        return .send(.delegate(.createSession(initialComposerText: nil)))
+
+      case .archivedButtonTapped:
+        // New presentation → new generation: outcomes of DELETEs initiated under an
+        // earlier presentation must not be re-injected into this one (see
+        // `archivedSheetGeneration`).
+        state.archivedSheetGeneration += 1
+        state.archived = ArchivedSessionsFeature.State(
+          connection: state.connection,
+          profileName: state.scopedProfileName,
+          now: state.now,
+          // Seed the sheet with the list's capability verdict so an already-flipped flag
+          // hides the sheet's Delete affordances from the start.
+          deleteSupported: state.deleteSupported
+        )
+        return .none
+
+      case let .archived(.presented(.delegate(.openSession(session)))):
+        // Open from the archived sheet → dismiss it and resume in the main stack.
+        state.archived = nil
+        return .send(.delegate(.openSession(session)))
+
+      case let .archived(.presented(.delegate(.deleted(id, session, index)))):
+        // A delete inside the archived sheet. The sheet already removed the row
+        // optimistically; the DELETE round-trip runs HERE — a presented child's effects
+        // are cancelled on dismissal, so a sheet-run DELETE racing Done/swipe-down would
+        // be silently dropped after the cache wipe already happened. Forward as this
+        // list's own `sessionDeleted` FIRST so `AppFeature` wipes the cached snapshot +
+        // turn anchor and tears the live-chat slot down when the id matches (an archived
+        // session CAN be the slot: opening one from the sheet resumes it without
+        // un-archiving, and another client can archive the slot's session).
+        let profileName = state.archived?.profileName
+        // Stamp the round-trip with the CURRENT presentation so its outcome can only be
+        // re-injected into this sheet instance (id alone is ambiguous after a
+        // dismiss-and-reopen re-deletes the same session).
+        let generation = state.archivedSheetGeneration
+        return .concatenate(
+          .send(.delegate(.sessionDeleted(id: id))),
+          .run { [rest, connection = state.connection] send in
+            do {
+              try await rest.deleteSession(connection, id, profileName)
+              await send(.archivedDeleteSucceeded(id: id, generation: generation))
+            } catch {
+              await send(.archivedDeleteFailed(
+                id: id, session: session, index: index, generation: generation,
+                error: asRESTError(error)
+              ))
+            }
+          }
+        )
+
+      case let .archivedDeleteSucceeded(id, generation):
+        finishRemovalPins(&state, id: id)
+        // Server confirmed the sheet-initiated delete → the badge delegate fires (see
+        // `Delegate.sessionDeleteSucceeded`), and the outcome is re-injected into the
+        // sheet ONLY while the SAME presentation (`generation`) still owns this delete
+        // (its `deletingIDs` guard holds the id) — a dismissed sheet has nothing to
+        // update, and a re-opened one is a different generation whose fresh fetch (or
+        // own re-delete of the same id) this must not touch.
+        let confirmed: Effect<Action> = .send(.delegate(.sessionDeleteSucceeded(id: id)))
+        guard generation == state.archivedSheetGeneration,
+          state.archived?.deletingIDs.contains(id) == true
+        else { return confirmed }
+        return .merge(confirmed, .send(.archived(.presented(.deleteSucceeded(id: id)))))
+
+      case let .archivedDeleteFailed(id, session, index, generation, error):
+        // Re-inject into the sheet while the SAME presentation still owns the delete
+        // (rollback + capability verdict happen there, and `deleteUnsupported` mirrors
+        // back here). With the sheet gone — or the outcome stamped by a PREVIOUS
+        // presentation (a stale failure must not clear a re-opened sheet's own guard and
+        // resurrect its row) — the outcome must not vanish: apply the capability
+        // verdict — it's server-wide — or the failure banner to the list itself.
+        if generation == state.archivedSheetGeneration,
+          state.archived?.deletingIDs.contains(id) == true {
+          return .send(.archived(.presented(.deleteFailed(
+            id: id, session: session, index: index, error: error
+          ))))
+        }
+        if error.isMissingEndpointVerdict {
+          state.deleteSupported = false
+        } else {
+          state.loadError = error.sessionMutationBanner("Couldn’t delete the session.")
+        }
+        return .none
+
+      case .archived(.presented(.delegate(.deleteUnsupported))):
+        // A delete inside the archived sheet answered 404/405 — mirror the capability
+        // verdict onto the list's own flag so its Delete affordances hide too.
+        state.deleteSupported = false
+        return .none
+
+      case .archived:
+        return .none
+
+      // MARK: Profiles
+
+      case let .profilesResponse(.success(result)):
+        state.profilesSupported = true
+        state.profiles = Self.dedupedProfiles(result)
+        // If the persisted selection no longer exists on the server, re-home to default.
+        if state.profiles[id: state.selectedProfileName] == nil {
+          state.selectedProfileName = Self.State.defaultProfileName
+        }
+        // Persisted on EVERY successful probe, "default" included: a persisted selection is
+        // what `AppFeature.makeHomeState` reads as "this agent has the profiles API", so the
+        // next launch scopes chats opened before its own probe answers (#114).
+        preferences.saveSelectedProfileID(state.selectedProfileName)
+        return load(&state)
+
+      case let .profilesResponse(.failure(error)):
+        // A 404 (old agent) withdraws the persisted capability. Transient failures keep it
+        // for the next launch while this session falls back to unscoped requests.
+        if error == .notFound { preferences.clearSelectedProfileID() }
+        state.profilesSupported = false
+        state.profiles = []
+        return load(&state)
+
+      case let .profilesRefreshed(result):
+        state.profilesSupported = true
+        state.profiles = Self.dedupedProfiles(result)
+        return .none
+
+      case let .selectProfile(name):
+        // No-op when already selected (avoids a redundant refetch / UI reset).
+        guard name != state.selectedProfileName else { return .none }
+        state.selectedProfileName = name
+        state.sessions = []
+        // Reset the list UI on switch (search doesn't carry across profiles).
+        state.searchQuery = ""
+        // Cron jobs are profile-scoped too: drop the old profile's jobs + peek so the
+        // section can't show cross-profile rows while the scoped refetch is in flight.
+        state.cronJobs = []
+        let collapse = collapseExpandedCronJob(&state)
+        preferences.saveSelectedProfileID(name)
+        return .merge(collapse, load(&state))
+
+      case .addProfileTapped:
+        state.addProfile = AddProfileFeature.State(connection: state.connection)
+        return .none
+
+      case let .addProfile(.presented(.delegate(.created(name)))):
+        // Dismiss the sheet, refresh the profile list (no fetch), THEN select the new profile
+        // (which does the single scoped fetch). Sequential so the refreshed list is in place
+        // before the switch, and avoids a redundant double fetch.
+        state.addProfile = nil
+        return .run { [profiles, connection = state.connection] send in
+          if let result = try? await profiles.list(connection) {
+            await send(.profilesRefreshed(result))
+          }
+          await send(.selectProfile(name: name))
+        }
+
+      case .addProfile:
+        return .none
+
+      case let .renameProfileTapped(name):
+        // Open the rename alert (default profile is never renamable).
+        guard let profile = state.profiles[id: name], !profile.isDefault else { return .none }
+        state.renamingProfileName = name
+        state.profileRenameDraft = profile.name
+        return .none
+
+      case .confirmRenameProfile:
+        guard let name = state.renamingProfileName else { return .none }
+        let newName = state.profileRenameDraft
+        state.renamingProfileName = nil
+        state.profileRenameDraft = ""
+        return .send(.renameProfileButtonTapped(name: name, newName: newName))
+
+      case .cancelRenameProfile:
+        state.renamingProfileName = nil
+        state.profileRenameDraft = ""
+        return .none
+
+      case let .renameProfileButtonTapped(name, newName):
+        // The default profile is never renamable — guard even if the view slips up.
+        guard let profile = state.profiles[id: name], !profile.isDefault else { return .none }
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != name, ProfileName.isValid(trimmed) else { return .none }
+        // Optimistic rename with rollback (mirrors session rename).
+        let previousProfiles = state.profiles
+        let previousSelected = state.selectedProfileName
+        var renamed = profile
+        renamed.name = trimmed
+        state.profiles[id: name] = nil
+        state.profiles.append(renamed)
+        if state.selectedProfileName == name {
+          state.selectedProfileName = trimmed
+          preferences.saveSelectedProfileID(trimmed)
+        }
+        return .run { [profiles, connection = state.connection] send in
+          do {
+            try await profiles.rename(connection, name, trimmed)
+            await send(.renameProfileSucceeded)
+          } catch {
+            await send(.renameProfileFailed(
+              previousProfiles: previousProfiles, previousSelected: previousSelected
+            ))
+          }
+        }
+
+      case .renameProfileSucceeded:
+        return .none
+
+      case let .renameProfileFailed(previousProfiles, previousSelected):
+        state.profiles = previousProfiles
+        state.selectedProfileName = previousSelected
+        preferences.saveSelectedProfileID(previousSelected)
+        state.loadError = "Couldn’t rename the profile."
+        return .none
+
+      case let .deleteProfileButtonTapped(name):
+        // The default profile is never deletable — guard even if the view slips up.
+        guard let profile = state.profiles[id: name], !profile.isDefault else { return .none }
+        state.confirmationDialog = ConfirmationDialogState {
+          TextState("Delete profile?")
+        } actions: {
+          ButtonState(role: .destructive, action: .confirmDeleteProfile(name: name)) {
+            TextState("Delete")
+          }
+          ButtonState(role: .cancel) {
+            TextState("Cancel")
+          }
+        } message: {
+          TextState("This permanently deletes the profile and its sessions on the server.")
+        }
+        return .none
+
+      case let .deleteProfileSucceeded(name):
+        state.profiles[id: name] = nil
+        // If the deleted profile was active, re-home to default and refetch its sessions.
+        if state.selectedProfileName == name {
+          state.selectedProfileName = Self.State.defaultProfileName
+          state.searchQuery = ""
+          state.cronJobs = []
+          let collapse = collapseExpandedCronJob(&state)
+          preferences.saveSelectedProfileID(Self.State.defaultProfileName)
+          return .merge(collapse, load(&state))
+        }
+        return .none
+
+      case .deleteProfileFailed:
+        state.loadError = "Couldn’t delete the profile."
+        return .none
+
+      case let .settings(.presented(.delegate(.tokenSaved(token)))):
+        state.connection.token = token
+        return .none
+
+      case .settings(.presented(.delegate(.disconnect))):
+        state.closeSettingsTab()
+        return .send(.delegate(.disconnect))
+
+      case .settings(.presented(.delegate(.reconnect))):
+        // Manual reconnect = re-fetch the list over REST.
+        return .send(.pulledToRefresh)
+
+      case let .settings(.presented(.delegate(.defaultSwipeActionChanged(action)))):
+        // Mirror the new default immediately (Settings already persisted it) so the swipe
+        // rows are right the moment the tab is left.
+        state.defaultSwipeAction = action
+        return .none
+
+      case let .settings(.presented(.delegate(.liveActivityToggled(enabled)))):
+        return .send(.delegate(.liveActivityToggled(enabled)))
+
+      case let .settings(.presented(.delegate(.liveActivityShowsTitlesToggled(shows)))):
+        return .send(.delegate(.liveActivityShowsTitlesToggled(shows)))
+
+      case .settings(.presented(.delegate(.installPushPlugin))):
+        // The Settings push guide's "Ask agent" → dismiss Settings (Settings already requested
+        // its own dismissal) and open a new chat with the install prompt pre-filled.
+        state.closeSettingsTab()
+        return .send(.delegate(.createSession(initialComposerText: PushSetup.installPrompt)))
+
+      case .settings(.dismiss):
+        // A child `dismiss()` (Reconnect, Sign out, "Ask agent") closes the tab: the
+        // presentation reducer nils `settings` after this runs, so fall back to Sessions here.
+        state.closeSettingsTab()
+        return .none
+
+      case .settings:
+        return .none
+
+      case .delegate:
+        return .none
+      }
+    }
+    .ifLet(\.$settings, action: \.settings) {
+      SettingsFeature()
+    }
+    .ifLet(\.$archived, action: \.archived) {
+      ArchivedSessionsFeature()
+    }
+    .ifLet(\.$addProfile, action: \.addProfile) {
+      AddProfileFeature()
+    }
+    .ifLet(\.$confirmationDialog, action: \.confirmationDialog)
+    // A profile switch (a selection, a deleted active profile re-homing to default, the probe
+    // re-homing or withdrawing the scope) makes the old unfiltered rows another profile's:
+    // drop them so the widgets hold ("unknown") until the scoped refetch lands, instead of
+    // projecting the previous profile's sessions. A rename (and its rollback) keeps the same
+    // sessions under a new name, so it keeps them.
+    .onChange(of: \.scopedProfileName) { _, _ in
+      Reduce { state, action in
+        switch action {
+        case .renameProfileButtonTapped, .renameProfileFailed:
+          break
+        default:
+          state.statusSessions = nil
+        }
+        return .none
+      }
+    }
+    // An open Settings tab can stay up for a long time (the old sheet was short-lived) while
+    // the list underneath keeps polling: mirror the facts `seedSettings` copied, so a capability
+    // flip, a profile re-homed by a delete, or a re-auth's new connection reaches it in the
+    // same action that changed it. A no-op while the tab is closed.
+    Reduce { state, _ in
+      state.syncSettingsSeed()
+      return .none
+    }
+  }
+
+  private func retireMigrationPin(server: String, id: Session.ID) {
+    guard var migration = preferences.loadPinMigration(server) else { return }
+    migration.pendingIDs.removeAll { $0 == id }
+    preferences.savePinMigration(server, migration)
+  }
+
+  private func finishRemovalPins(_ state: inout State, id: Session.ID) {
+    // Confirmed removal supersedes a pending pin's rollback, without canceling its RPC.
+    state.pinMutations[id]?.previousIndex = nil
+    state.pinnedIDs.removeAll { $0 == id }
+    preferences.savePinnedIDs(state.pinnedIDs)
+  }
+
+  private func setPinned(_ state: inout State, id: Session.ID, pinned: Bool) -> Effect<Action> {
+    guard state.canChangePin(id: id), state.pinnedIDs.contains(id) != pinned else { return .none }
+    let previousIndex = state.pinnedIDs.firstIndex(of: id)
+    if pinned { state.pinnedIDs.append(id) }
+    else { state.pinnedIDs.removeAll { $0 == id } }
+    preferences.savePinnedIDs(state.pinnedIDs)
+    // A server-keyed checkpoint is also evidence of pin capability. Search omits
+    // pinned, so it must use that evidence rather than the individual search row.
+    guard state.canWritePinsToServer,
+      preferences.loadPinMigration(state.pinMigrationServerID) != nil
+        || (!state.isSearching && state.sessions[id: id]?.pinned != nil)
+    else { return .none }
+
+    let mutation = PinMutation(pinned: pinned, previousIndex: previousIndex,
+      profileName: state.selectedProfileName)
+    state.pinMutations[id] = mutation
+    return .run { [rest, connection = state.connection] send in
+      let error: RESTError?
+      do {
+        try await rest.setPinned(connection, id, pinned, mutation.profileName)
+        error = nil
+      } catch let failure { error = asRESTError(failure) }
+      await send(.pinWriteFinished(id: id, profileName: mutation.profileName, error: error))
+    }
+  }
+
+  private func applySessionsResponse(
+    _ result: Result<[Session], RESTError>, state: inout State, reconcilePins: Bool
+  ) -> Effect<Action> {
+    switch result {
+    case let .success(sessions):
+      // Loading clears old errors; keep mutation failures raised during this fetch.
+      // Belt-and-suspenders: drop any session whose archive PATCH or DELETE is still in
+      // flight, so a fetch that completes during that window can't repopulate the removed row.
+      let inFlight = state.archivingIDs.union(state.deletingIDs)
+      let filtered = inFlight.isEmpty
+        ? sessions
+        : sessions.filter { !inFlight.contains($0.id) }
+      // The list AND search endpoints can return the same session id more than once
+      // (#78). `IdentifiedArray(uniqueElements:)` preconditions on unique ids and
+      // trapped in the field, so dedupe first — keep the FIRST occurrence (server order).
+      state.sessions = IdentifiedArray(filtered, uniquingIDsWith: { first, _ in first })
+      // Only an unfiltered response feeds the widgets' source. The list and search fetches
+      // share `CancelID.fetch` (cancel-in-flight), so the response landing now is the one
+      // the current query started: searching ⇔ a search response.
+      if !state.isSearching {
+        state.statusSessions = state.sessions
+      }
+      state.isLoading = state.awaitsCronJobs
+      let visible = state.sessions
+      // Seed last-seen counts for newly-discovered sessions so they don't all show as
+      // unread on first sight; only later increases flag unread.
+      var seeded = false
+      for session in visible where state.seenCounts[session.id] == nil {
+        state.seenCounts[session.id] = session.messageCount ?? 0
+        seeded = true
+      }
+      var effects: [Effect<Action>] = []
+      if seeded { effects.append(persistSeenCounts(state.seenCounts)) }
+      // Only a capable list reconciles membership. Search never imports pins or
+      // enrolls legacy migration, and absent/nil list rows leave pending IDs intact.
+      if reconcilePins && visible.contains(where: { $0.pinned != nil }) {
+        let oldPins = state.pinnedIDs
+        let server = state.pinMigrationServerID
+        var migration = preferences.loadPinMigration(server) ?? PinMigration(pendingIDs: oldPins)
+        migration.pendingIDs.removeAll { id in
+          visible[id: id]?.pinned == true && state.canChangePin(id: id)
+        }
+        // Upload only pins the user still has: a local-only unpin (server writes off this
+        // launch) leaves its id pending, and pushing it would re-pin it everywhere.
+        for session in visible where migration.pendingIDs.contains(session.id)
+          && state.pinnedIDs.contains(session.id)
+          && session.pinned == false && state.canChangePin(id: session.id) {
+          let mutation = PinMutation(pinned: true,
+            previousIndex: state.pinnedIDs.firstIndex(of: session.id),
+            profileName: state.selectedProfileName)
+          state.pinMutations[session.id] = mutation
+          effects.append(.run { [rest, connection = state.connection] send in
+            let error: RESTError?
+            do {
+              try await rest.setPinned(connection, session.id, true, mutation.profileName)
+              error = nil
+            } catch let failure { error = asRESTError(failure) }
+            await send(.pinMigrationFinished(server: server, id: session.id,
+              profileName: mutation.profileName, error: error))
+          })
+        }
+        // Persist before dispatch, but retire only explicit true or acknowledged writes.
+        preferences.savePinMigration(server, migration)
+        let pending = Set(migration.pendingIDs)
+        let unpinned = Set(visible.filter {
+          $0.pinned == false && !pending.contains($0.id) && state.pinMutations[$0.id] == nil
+        }.map(\.id))
+        state.pinnedIDs.removeAll { unpinned.contains($0) }
+        var membership = Set(state.pinnedIDs)
+        for session in visible where session.pinned == true && state.pinMutations[session.id] == nil {
+          if membership.insert(session.id).inserted { state.pinnedIDs.append(session.id) }
+        }
+        if state.pinnedIDs != oldPins { preferences.savePinnedIDs(state.pinnedIDs) }
+      }
+      return .merge(effects)
+
+    case let .failure(error):
+      state.isLoading = false
+      state.loadError = error.message
+      return .none
+
+    }
+  }
+
+  /// Refresh "now" + the section calendar, clear errors, and reload the non-secret persisted
+  /// prefs (seen counts, pins, swipe action, tips dismissal). Shared by `.task` and `load()`
+  /// — `.task` additionally reloads the selected profile before probing the profiles
+  /// capability.
+  private func reloadPrefs(_ state: inout State) {
+    state.now = now
+    state.calendar = calendar
+    state.loadError = nil
+    state.seenCounts = preferences.loadSeenCounts()
+    state.pinnedIDs = preferences.loadPinnedIDs()
+    state.defaultSwipeAction = preferences.loadDefaultSessionSwipeAction()
+    state.showsOnboardingTips = !preferences.loadOnboardingTipsDismissed()
+  }
+
+  /// Refresh "now", clear errors, reload persisted prefs, and fetch the session list
+  /// (scoped to `scopedProfileName`; unscoped without the profiles API).
+  private func load(_ state: inout State) -> Effect<Action> {
+    reloadPrefs(&state)
+    state.isLoading = true
+    // The open job's runs refresh with every list load (poll, pull-to-refresh, the Run now
+    // success), alongside — never inside — the shared-`fetch` list effect. Only while the
+    // Cron Jobs tab is on screen (never on the Sessions tab or while searching).
+    let runs = state.effectiveTab == .cron ? fetchExpandedCronRuns(state) : .none
+    return .merge(runs, loadList(state))
+  }
+
+  /// The list (+ jobs) half of `load`, on the shared `fetch` id.
+  private func loadList(_ state: State) -> Effect<Action> {
+    .run { [
+      rest, profiles, connection = state.connection, query = state.searchQuery,
+      profile = state.scopedProfileName, cronJobsSupported = state.cronJobsSupported
+    ] send in
+      await send(fetchSessions(
+        rest: rest, profiles: profiles, connection: connection, query: query, profile: profile
+      ))
+      // Refresh the cron jobs in the SAME effect, after the list, so the two responses
+      // arrive in a deterministic order (no racy merge). Skipped while searching (the
+      // section is hidden then) and once the agent proved it lacks the API.
+      if cronJobsSupported, query.trimmingCharacters(in: .whitespaces).isEmpty {
+        await send(fetchCronJobs(rest: rest, connection: connection, profile: profile))
+      }
+    }
+    // Shared `fetch` id: a newer load/search/poll cancels this one, so an older in-flight
+    // fetch finishing late can't overwrite `state.sessions` (stale list or search results).
+    .cancellable(id: CancelID.fetch, cancelInFlight: true)
+  }
+
+  /// A successful archive/delete/rename just lifted its in-flight guard — that guard was
+  /// the only thing filtering the removed/renamed row out of a landing response, so a
+  /// fetch that started during the RPC window must not deliver its stale response now.
+  /// When one is actually pending (`isLoading`, or an active search whose debounced fetch
+  /// may be in flight — and the poll is paused while searching, so nothing would
+  /// self-heal), RESTART the current-context fetch: it supersedes the stale one
+  /// (`cancelInFlight`) and lands an authoritative post-RPC response instead of stranding
+  /// a stuck spinner or stale search results. Otherwise a bare cancel suffices (the poll
+  /// is the backstop). A JUST-CLEARED search is covered by the `isLoading` arm: clearing
+  /// the query reloads through `load` (see the `searchQuery` binding), which raises the
+  /// flag — the debounced search effect is the only fetch that raises neither.
+  private func cancelOrRestartFetch(_ state: inout State) -> Effect<Action> {
+    guard state.isLoading || state.isSearching else { return .cancel(id: CancelID.fetch) }
+    return load(&state)
+  }
+
+  /// THE rollback rule for a failed archive/delete RPC (the server still has the session,
+  /// so the optimistic removal must be undone). Two halves, deliberately asymmetric:
+  ///
+  /// - **Pin + seen baseline: ALWAYS restored and persisted.** Both live under single
+  ///   device-global prefs keys keyed by session id (`PreferencesClient` — they are not
+  ///   profile-scoped), so the restore is correct whatever list the UI shows now; skipping
+  ///   it would permanently lose the pin/unread baseline for a session the server kept.
+  /// - **The row re-insert applies ONLY while the list still shows the SAME context the
+  ///   RPC was issued under** — same profile scope AND same (raw) search query. After a
+  ///   mid-flight profile switch the captured session belongs to the OLD profile's list
+  ///   (a cross-profile row would open under the wrong scope), and after a query change
+  ///   the saved index points into a DIFFERENT result set (the poll is paused while
+  ///   searching, so a wrong-query row would stick). A skipped re-insert self-heals: the
+  ///   original context's next fetch returns the still-existing row.
+  private func rollBackFailedRemoval(
+    _ state: inout State, id: Session.ID, session: Session, index: Int,
+    pinIndex: Int?, seenCount: Int?, profileName: String?, searchQuery: String
+  ) {
+    if let pinIndex {
+      let pinAt = min(pinIndex, state.pinnedIDs.count)
+      state.pinnedIDs.insert(id, at: pinAt)
+    }
+    state.seenCounts[id] = seenCount
+    preferences.savePinnedIDs(state.pinnedIDs)
+    preferences.saveSeenCounts(state.seenCounts)
+    if profileName == state.scopedProfileName, searchQuery == state.searchQuery {
+      let insertAt = min(index, state.sessions.count)
+      state.sessions.insert(session, at: insertAt)
+    }
+  }
+
+  /// Whether the push card is currently snoozed — a persisted `until` exists and `now` is
+  /// still before it. A cleared snooze (authorized/logout) or an elapsed window returns `false`.
+  private func isPushPromptSnoozed() -> Bool {
+    guard let snooze = preferences.loadPushPromptSnooze() else { return false }
+    return now < snooze.until
+  }
+
+  /// Seed the Settings tab from the list's current facts. Fresh on every visit (the tab's
+  /// state is dropped on leave), so a profile switch, capability flip or pref change since
+  /// the last visit is always reflected. `connection` carries the auth session (the Auth row
+  /// / token-field gate read it).
+  private func seedSettings(_ state: inout State) {
+    state.settings = SettingsFeature.State(
+      connection: state.connection,
+      pushAvailable: state.pushAvailable,
+      defaultSwipeAction: state.defaultSwipeAction,
+      deleteSupported: state.deleteSupported,
+      liveActivityEnabled: preferences.loadLiveActivityEnabled(),
+      liveActivityShowsTitles: preferences.loadLiveActivityShowsTitles(),
+      profileName: state.scopedProfileName
+    )
+  }
+
+  /// Fetch the expanded job's recent runs (`GET /api/cron/jobs/{id}/runs`, capped to
+  /// `cronPeekLimit`, profile-scoped like the jobs fetch). A no-op with nothing expanded or
+  /// on an agent without the jobs API. `cancelInFlight` on its own id: a refresh or a switch
+  /// supersedes the previous fetch without touching the list load.
+  private func fetchExpandedCronRuns(_ state: State) -> Effect<Action> {
+    guard let jobID = state.expandedCronJobID, state.cronJobsSupported else { return .none }
+    return .run { [rest, connection = state.connection, profile = state.scopedProfileName] send in
+      await send(fetchCronRuns(rest: rest, connection: connection, jobID: jobID, profile: profile))
+    }
+    .cancellable(id: CancelID.cronRuns, cancelInFlight: true)
+  }
+
+  /// A jobs-only refetch, outside the list load (a cron action changed a job, not the list).
+  private func refetchCronJobs(_ state: State) -> Effect<Action> {
+    .run { [rest, connection = state.connection, profile = state.scopedProfileName] send in
+      await send(fetchCronJobs(rest: rest, connection: connection, profile: profile))
+    }
+  }
+
+  /// The banner for a confirmed delete that hits the job's in-flight guard.
+  static let cronJobBusyMessage = "Another action on this job is still running. Try again in a moment."
+
+  /// Collapse the expanded job: clear the id and its runs slot, and cancel a runs fetch in
+  /// flight. THE one collapse path (tap, the jobs-API 404 flip, profile switches, deleting
+  /// the expanded job, a jobs refetch that no longer lists it).
+  private func collapseExpandedCronJob(_ state: inout State) -> Effect<Action> {
+    state.expandedCronJobID = nil
+    state.expandedCronRuns = nil
+    state.expandedCronRunsFailed = false
+    return .cancel(id: CancelID.cronRuns)
+  }
+
+  /// Shared trigger/pause/resume/delete flow: guard against a double-fire while the job's
+  /// RPC is in flight, then run it and funnel the outcome through `.cronJobActionFinished`.
+  /// Threads the same profile scoping as the jobs fetch (`scopedProfileName`).
+  private func performCronAction(
+    _ state: inout State,
+    id: String,
+    kind: Action.CronJobActionKind,
+    rpc: @escaping @Sendable (HermesRESTClient, ServerConnection, String, String?) async throws -> Void
+  ) -> Effect<Action> {
+    guard !state.cronActionInFlightIDs.contains(id) else { return .none }
+    state.cronActionInFlightIDs.insert(id)
+    let profile = state.scopedProfileName
+    return .run { [rest, connection = state.connection] send in
+      do {
+        try await rpc(rest, connection, id, profile)
+        await send(.cronJobActionFinished(id: id, kind: kind, error: nil))
+      } catch let error as RESTError {
+        await send(.cronJobActionFinished(id: id, kind: kind, error: error))
+      } catch {
+        await send(.cronJobActionFinished(id: id, kind: kind, error: .unreachable))
+      }
+    }
+  }
+
+  private func markLocallyRead(_ id: Session.ID, state: inout State) -> Effect<Action> {
+    guard let session = state.sessions[id: id] else { return .none }
+    // Preserve the legacy device watermark for older agents. The app-level common-open
+    // path owns the shared server acknowledgement so archived and push opens cannot bypass it.
+    state.seenCounts[id] = session.messageCount ?? state.seenCounts[id] ?? 0
+    if session.unread != nil {
+      state.sessions[id: id]?.unread = false
+    }
+    return persistSeenCounts(state.seenCounts)
+  }
+
+  private func persistSeenCounts(_ counts: [String: Int]) -> Effect<Action> {
+    .run { [preferences] _ in preferences.saveSeenCounts(counts) }
+  }
+
+  /// Build the profile array tolerating a duplicate `name` in the server response (keep
+  /// the first occurrence) — `IdentifiedArray(uniqueElements:)` traps on duplicates (#78).
+  private static func dedupedProfiles(_ profiles: [Profile]) -> IdentifiedArrayOf<Profile> {
+    IdentifiedArray(profiles, uniquingIDsWith: { first, _ in first })
+  }
+}
+
+private enum SessionListCalendarKey: DependencyKey {
+  static let liveValue = Calendar.autoupdatingCurrent
+  // Same value as `State.calendar`'s default so capturing it on load is a no-op diff in
+  // every exhaustive TestStore; date-section tests override it with a pinned calendar.
+  static let testValue = Calendar.autoupdatingCurrent
+}
+
+public extension DependencyValues {
+  /// The calendar the session list's date sections bucket with. A dedicated key rather than
+  /// the library's `\.calendar`, whose test value is unimplemented — reading that from the
+  /// shared `reloadPrefs` would report an issue in every suite that loads the list.
+  var sessionListCalendar: Calendar {
+    get { self[SessionListCalendarKey.self] }
+    set { self[SessionListCalendarKey.self] = newValue }
+  }
+}
+
+/// Fetch the cron jobs and map to a response action. `profile` is the list's
+/// `scopedProfileName`; nil (no profiles API) omits the param (see `rest.cronJobs`).
+private func fetchCronJobs(
+  rest: HermesRESTClient,
+  connection: ServerConnection,
+  profile: String?
+) async -> SessionListFeature.Action {
+  do {
+    return .cronJobsResponse(.success(try await rest.cronJobs(connection, profile)))
+  } catch let error as RESTError {
+    return .cronJobsResponse(.failure(error))
+  } catch {
+    return .cronJobsResponse(.failure(.unreachable))
+  }
+}
+
+/// Fetch one job's recent runs (capped to `cronPeekLimit`) and map to a response tagged with
+/// the job, so a late answer for a job no longer expanded is dropped.
+private func fetchCronRuns(
+  rest: HermesRESTClient,
+  connection: ServerConnection,
+  jobID: String,
+  profile: String?
+) async -> SessionListFeature.Action {
+  do {
+    let runs = try await rest.cronJobRuns(
+      connection, jobID, profile, SessionListFeature.State.cronPeekLimit
+    )
+    return .cronRunsResponse(jobID: jobID, .success(runs))
+  } catch let error as RESTError {
+    return .cronRunsResponse(jobID: jobID, .failure(error))
+  } catch {
+    return .cronRunsResponse(jobID: jobID, .failure(.unreachable))
+  }
+}
+
+/// Fetch the list (or search results when a query is present) and map to a response.
+///
+/// `profile` is the list's `scopedProfileName`: when set, the list goes through the
+/// profile-scoped endpoint and search carries it too (mirrors the desktop); nil (no
+/// profiles API) keeps today's unscoped requests.
+private func fetchSessions(
+  rest: HermesRESTClient,
+  profiles: HermesProfileClient,
+  connection: ServerConnection,
+  query rawQuery: String,
+  profile: String?
+) async -> SessionListFeature.Action {
+  let query = rawQuery.trimmingCharacters(in: .whitespaces)
+  @Sendable func page(_ source: SessionSourceFilter, limit: Int) async throws -> [Session] {
+    if let profile {
+      return try await profiles.sessions(connection, profile, .exclude, .recent, limit, 0, source)
+    }
+    return try await rest.sessions(connection, limit, 0, .recent, source)
+  }
+  do {
+    if !query.isEmpty {
+      return .sessionsResponse(.success(try await rest.search(connection, query, profile)))
+    }
+    // Two independent slices, like the desktop sidebar: cron runs are always the newest
+    // rows, so one shared page lets a busy job starve the interactive list.
+    let interactive = try await page(.interactive, limit: SessionListFeature.interactivePageSize)
+    let cron = try await page(.cron, limit: SessionListFeature.cronPageSize)
+    return .sessionsResponse(.success(mergeSessionSlices(interactive, cron)))
+  } catch let error as RESTError {
+    return .sessionsResponse(.failure(error))
+  } catch {
+    return .sessionsResponse(.failure(.unreachable))
+  }
+}
+
+/// The interactive slice followed by every cron-slice row it doesn't already carry. An agent
+/// that ignores the source scoping returns the same unscoped page for both slices, which
+/// merges back to that one page.
+func mergeSessionSlices(_ interactive: [Session], _ cron: [Session]) -> [Session] {
+  let seen = Set(interactive.map(\.id))
+  return interactive + cron.filter { !seen.contains($0.id) }
+}

@@ -1,0 +1,1394 @@
+import ComposableArchitecture
+import DependenciesMacros
+import Foundation
+import os
+
+// MARK: - Connection & status
+
+/// Where and how to reach a Hermes server. `auth` carries the regime (token, cookie, or
+/// bearer); the unauthenticated reachability probe (`/api/status`) goes through
+/// `status(baseURL:)` without a `ServerConnection`.
+public struct ServerConnection: Equatable, Sendable {
+  public var baseURL: URL
+  public var auth: AuthSession
+
+  public init(baseURL: URL, auth: AuthSession) {
+    self.baseURL = baseURL
+    self.auth = auth
+  }
+
+  /// Convenience for the common token-mode case so existing call sites stay byte-identical.
+  public init(baseURL: URL, token: String) {
+    self.init(baseURL: baseURL, auth: .token(token))
+  }
+
+  /// The session token when authenticating in `.token` mode; `nil` in `.cookie` mode (which
+  /// uses the cookie jar) and `.bearer` mode (whose access token is owned and rotated by
+  /// `BearerTokenStore`, never read from here). Drives the existing `X-Hermes-Session-Token`
+  /// REST/WS paths. Setting a value switches the connection into `.token` mode (token-mode
+  /// editing in Settings); setting `nil` is ignored (the other regime is the source of
+  /// truth then).
+  public var token: String? {
+    get { auth.token }
+    set { if let newValue { auth = .token(newValue) } }
+  }
+}
+
+public enum SessionOrder: String, Sendable {
+  case created
+  case recent
+}
+
+/// Source scoping for a session list request (`source=` / `exclude_sources=` on
+/// `/api/sessions` and `/api/profiles/sessions`). The list fetches interactive sessions and
+/// cron runs as two independent slices, like the desktop: cron runs are always the newest
+/// rows, so in one shared page a busy job crowds real conversations out of the window.
+/// Agents that predate the parameters ignore them and return the unscoped page.
+public enum SessionSourceFilter: Equatable, Sendable {
+  /// No scoping — every source.
+  case all
+  /// Everything except these sources.
+  case excluding([String])
+  /// Only this source.
+  case only(String)
+
+  /// The interactive list: everything but cron runs.
+  public static let interactive = SessionSourceFilter.excluding([Session.cronSource])
+  /// The Cron Jobs tab's runs.
+  public static let cron = SessionSourceFilter.only(Session.cronSource)
+
+  var queryItems: [URLQueryItem] {
+    switch self {
+    case .all: []
+    case let .excluding(sources): [.init(name: "exclude_sources", value: sources.joined(separator: ","))]
+    case let .only(source): [.init(name: "source", value: source)]
+    }
+  }
+}
+
+/// How ONE outgoing REST request authenticates.
+///
+/// The transport helpers (`get`/`postJSON`/`send`) take this instead of an optional token
+/// string, so the auth regime is resolved exactly once per request — by
+/// ``resolveAuth(for:session:tokenStore:)`` — and the header-setting code below is the only
+/// place either auth header is written.
+///
+/// **Backward-compatibility guard:** `.sessionToken` must stay byte-identical to the legacy
+/// single-token path (`X-Hermes-Session-Token`, value verbatim, no `Authorization`), and
+/// `.none` must send neither header — a `.cookie` request is authenticated by the URLSession
+/// cookie jar. Both are pinned by tests in `HermesRESTClientTests`.
+public enum RequestAuth: Equatable, Sendable {
+  /// No auth header at all: the public probes (`/api/status`, `/api/auth/providers`), the
+  /// native-flow token endpoints, and every `.cookie` request (the jar carries it).
+  case none
+  /// `.token` regime — `X-Hermes-Session-Token: <token>`.
+  case sessionToken(String)
+  /// `.bearer` regime — `Authorization: Bearer <access_token>`, where the token came from
+  /// `BearerTokenStore.validAccessToken` and is therefore known-fresh.
+  case bearer(String)
+
+  /// The single place an auth header is attached to a request.
+  func apply(to request: inout URLRequest) {
+    switch self {
+    case .none:
+      break
+    case let .sessionToken(token):
+      request.setValue(token, forHTTPHeaderField: "X-Hermes-Session-Token")
+    case let .bearer(token):
+      request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+  }
+}
+
+/// Subset of `/api/status` we use for the reachability/health check (lenient).
+public struct ServerStatus: Equatable, Sendable, Decodable {
+  public var version: String?
+  public var gatewayRunning: Bool?
+  public var gatewayState: String?
+  public var activeSessions: Int?
+  /// `true` when the server is in the gated (password/OAuth) regime; absent on older
+  /// servers (treat absent/`false` as token-only).
+  public var authRequired: Bool?
+  /// Provider names advertised by the server (e.g. `["basic"]`); absent on older servers.
+  public var authProviders: [String]?
+  /// Interactive login flows the gate supports — gated servers report `["cookie"]`, plus
+  /// `"native_pkce"` once any interactive session provider is registered. Absent on older
+  /// gateways (treat absent as "no native flow": a provider button needs positive evidence).
+  public var authFlows: [String]?
+
+  enum CodingKeys: String, CodingKey {
+    case version
+    case gatewayRunning = "gateway_running"
+    case gatewayState = "gateway_state"
+    case activeSessions = "active_sessions"
+    case authRequired = "auth_required"
+    case authProviders = "auth_providers"
+    case authFlows = "auth_flows"
+  }
+}
+
+public enum RESTError: Error, Equatable, Sendable {
+  case unauthorized          // 401 — token missing/invalid, or bad password-login creds
+  case notFound              // 404 — also an unknown/unsupported password provider
+  case rateLimited           // 429 — too many login attempts (10/min/IP)
+  case serviceUnavailable    // 503 — auth provider unreachable
+  /// Other non-2xx. `detail` carries the server's body verbatim when present (JSON
+  /// `{"detail": …}`, else trimmed plain-text body) so callers can surface it.
+  case server(status: Int, detail: String? = nil)
+  /// The device itself has no usable network (airplane mode, Wi-Fi/cellular off, data
+  /// disallowed). Split out of `.unreachable` so the launch connection-failed screen can
+  /// tell "you're offline" from "the server didn't answer" — see `init(transport:)`.
+  case offline
+  case unreachable           // transport failure / non-HTTP response
+  case decoding              // 2xx body didn't match the expected shape
+  case transcriptionFailed(String) // 2xx but `{ok:false}` — carries the server's reason
+
+  /// Map a raw transport failure (what `URLSession` throws) to a `RESTError`. Only the
+  /// URLError codes that mean *this device has no network at all* become `.offline`;
+  /// everything else — timeout, DNS failure, connection refused, TLS, cancellation, a
+  /// non-`URLError` — stays `.unreachable`, because from the client's point of view the
+  /// network was usable and the server simply didn't answer.
+  ///
+  /// Only ever hand this a RAW transport failure: an already-typed `RESTError` is not a
+  /// `URLError`, so it would be flattened to `.unreachable`. Reducers normalise via
+  /// `asRESTError`, which checks the typed case first and then defers here.
+  public init(transport error: any Error) {
+    guard let urlError = error as? URLError else {
+      self = .unreachable
+      return
+    }
+    switch urlError.code {
+    case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff:
+      self = .offline
+    default:
+      self = .unreachable
+    }
+  }
+
+  /// The definitive "this agent lacks the endpoint" verdict for capability gating —
+  /// usually a plain 404, with one wrinkle: when the path exists for other verbs (e.g.
+  /// `/api/sessions/{id}` serves `PATCH`/`GET` on older agents), an unsupported method
+  /// answers **405 Method Not Allowed** instead, so both count. Callers flip their
+  /// `*Supported` flag off this SILENTLY (no banner), like the other capability gates.
+  public var isMissingEndpointVerdict: Bool {
+    switch self {
+    case .notFound, .server(status: 405, detail: _): true
+    default: false
+    }
+  }
+
+  /// A readable reason for an agent's refusal of a fenced session write (`mutateSession`),
+  /// keyed on the reason code the server puts in `detail`; `nil` for anything else.
+  public var sessionMutationRefusal: String? {
+    guard case let .server(_, detail?) = self else { return nil }
+    // `client_upgrade_required` carries prose after a colon.
+    switch detail.prefix(while: { $0 != ":" }) {
+    case "revision_conflict", "stale_generation":
+      return "It changed on another device. Try again."
+    case "session_busy":
+      return "The session is busy. Try again when its turn ends."
+    case "client_upgrade_required", "mutation_identity_required":
+      return "This agent needs a newer version of the app."
+    case "profile_mismatch":
+      return "It belongs to a different profile."
+    case "permission_denied":
+      return "This account can’t change it."
+    case "runtime_draining", "storage_unavailable":
+      return "The agent is unavailable right now. Try again shortly."
+    default:
+      return nil
+    }
+  }
+
+  /// `base` (the action's banner), followed by the refusal reason when there is one.
+  public func sessionMutationBanner(_ base: String) -> String {
+    sessionMutationRefusal.map { "\(base) \($0)" } ?? base
+  }
+
+  public var message: String {
+    switch self {
+    case .unauthorized: "Invalid or missing token."
+    case .notFound: "Not found."
+    case .rateLimited: "Too many login attempts. Try again shortly."
+    case .serviceUnavailable: "The auth provider is unreachable. Try again later."
+    // Prefer the server's detail verbatim (e.g. an Add-profile 400 reason); fall back
+    // to the generic status message when the body was empty/unparseable.
+    case let .server(status, detail):
+      if let detail, !detail.isEmpty { detail } else { "Server error (\(status))." }
+    case .offline: "No internet connection."
+    case .unreachable: "Couldn’t reach the server."
+    case .decoding: "Unexpected response — is this a Hermes server?"
+    case let .transcriptionFailed(reason): reason.isEmpty ? "Couldn’t transcribe the audio." : reason
+    }
+  }
+}
+
+// MARK: - Client
+
+@DependencyClient
+public struct HermesRESTClient: Sendable {
+  /// Unauthenticated reachability/health probe.
+  public var status: @Sendable (_ baseURL: URL) async throws -> ServerStatus
+  /// The onboarding Server step's probe (#136): the same unauthenticated `GET /api/status`
+  /// as `status`, but every failure is classified from the RAW `URLError` / HTTP response
+  /// into a typed `ProbeFailure` (a 2xx body without a Hermes `version` is `.notHermes`), so each
+  /// failure card can say what went wrong. Never throws. The launch path keeps `status`.
+  public var probeStatus: @Sendable (_ baseURL: URL) async -> Result<ServerStatus, ProbeFailure> = { _ in
+    // `@DependencyClient` needs a default for a non-throwing closure; an unstubbed call
+    // still reports an unimplemented issue in tests.
+    .failure(.requestFailed("probeStatus is unimplemented"))
+  }
+  /// Public capability probe — `GET /api/auth/providers` → `[{name, display_name,
+  /// supports_password}]`. Returns `nil` on older servers that 404 this endpoint (treat as
+  /// token-only); other transport/HTTP errors still throw.
+  public var authProviders: @Sendable (_ baseURL: URL) async throws -> [AuthProvider]?
+  /// Username/password login — `POST /auth/password-login` JSON `{provider, username,
+  /// password}`. On `200` captures the `Set-Cookie` jar into a `CookieSession` (cookies +
+  /// username + provider) and returns it. Errors map to `RESTError`: `401` invalid creds,
+  /// `429` rate-limited, `503` provider unreachable, `404` unknown/unsupported provider.
+  public var passwordLogin: @Sendable (_ baseURL: URL, _ provider: String, _ username: String, _ password: String) async throws -> CookieSession
+  /// Redeem a native-flow authorization code — `POST /auth/native/token` `{code,
+  /// code_verifier}` → the bearer token set. Unauthenticated (the verifier IS the
+  /// credential). Any gateway rejection is a generic 400 → `RESTError.server(400, detail)`.
+  public var nativeTokenExchange: @Sendable (_ baseURL: URL, _ code: String, _ verifier: String) async throws -> BearerSession
+  /// Rotate the bearer token pair — `POST /auth/native/refresh` `{refresh_token, provider}`.
+  /// 401 → `.unauthorized` (the refresh token is dead), 503 → `.serviceUnavailable` (keep
+  /// the tokens and retry). Callers do NOT invoke this directly: `BearerTokenStore` owns the
+  /// rotation and this is the transport it is handed.
+  public var nativeRefresh: @Sendable (_ baseURL: URL, _ session: BearerSession) async throws -> BearerSession
+  /// Best-effort `POST /auth/logout`, called only for the `.bearer` regime
+  /// (`AppFeature.serverSideLogout`). Non-throwing BY DESIGN — see
+  /// the live implementation for why this is the one call that swallows its failure.
+  ///
+  /// Call it BEFORE `BearerTokenStore.clear()`: once the store is drained the request has
+  /// nothing to authenticate with and is skipped (silently, like any other failure).
+  public var logout: @Sendable (_ connection: ServerConnection) async -> Void = { _ in }
+  public var sessions: @Sendable (_ connection: ServerConnection, _ limit: Int, _ offset: Int, _ order: SessionOrder, _ source: SessionSourceFilter) async throws -> [Session]
+  /// Just the archived (soft-hidden) sessions — `GET /api/sessions?archived=only`.
+  public var archivedSessions: @Sendable (_ connection: ServerConnection, _ limit: Int, _ offset: Int) async throws -> [Session]
+  /// Full-text search — `GET /api/sessions/search?q=…`. A non-nil `profile` adds
+  /// `&profile=` (searches that profile's `state.db`); `nil` → today's exact request.
+  public var search: @Sendable (_ connection: ServerConnection, _ query: String, _ profile: String?) async throws -> [Session]
+  /// Soft-hide (archive) or restore a session — `PATCH /api/sessions/{id}` `{"archived":…}`.
+  /// Pass `profile` (the literal name, `"default"` included — see
+  /// `SessionListFeature.State.scopedProfileName`) to scope to that profile (added to both
+  /// query and body); `nil` omits it. Like every session write (archive, unread, pin, rename,
+  /// delete) it goes through `mutateSession`: a `mutation-snapshot` read first, then the write
+  /// fenced with `request_id` + `expected_revision` on agents that require it (v0.22.1+).
+  public var archive: @Sendable (_ connection: ServerConnection, _ id: String, _ archived: Bool, _ profile: String?) async throws -> Void
+  /// Set the shared unread flag — `PATCH /api/sessions/{id}` `{"unread":…}`. Sending
+  /// `false` on every open both acknowledges current activity and starts tracking a legacy
+  /// row whose server watermark is still nil. `profile` follows the archive/rename rule.
+  public var setUnread: @Sendable (_ connection: ServerConnection, _ id: String, _ unread: Bool, _ profile: String?) async throws -> Void
+  /// Set Desktop-shared pin state — `PATCH /api/sessions/{id}` `{"pinned":…}`.
+  /// `profile` scopes the mutation to the session's owning profile.
+  public var setPinned: @Sendable (_ connection: ServerConnection, _ id: String, _ pinned: Bool, _ profile: String?) async throws -> Void
+  /// Rename a session — `PATCH /api/sessions/{id}` `{"title":…}`. An empty title clears it.
+  /// The server may reject with 400 (too long / invalid chars / duplicate).
+  /// `profile` follows the archive rule.
+  public var rename: @Sendable (_ connection: ServerConnection, _ id: String, _ title: String, _ profile: String?) async throws -> Void
+  /// Permanently delete a session — `DELETE /api/sessions/{id}`. `profile` follows
+  /// the archive rule (query param only — DELETE has no body). The endpoint is
+  /// idempotent: deleting an already-absent session still answers 2xx
+  /// (`{ok, already_absent}`), so any 2xx is success and the body is discarded.
+  ///
+  /// Callers flip their `deleteSupported` gate on `RESTError.isMissingEndpointVerdict`
+  /// (404 OR 405 — see that property for the older-agent wrinkle).
+  public var deleteSession: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?) async throws -> Void
+  /// Transcribe recorded audio — `POST /api/audio/transcribe` `{data_url, mime_type?}` →
+  /// `{ok, transcript}`. Returns the transcript text; throws `.transcriptionFailed` on `ok:false`.
+  public var transcribe: @Sendable (_ connection: ServerConnection, _ dataURL: String, _ mimeType: String?) async throws -> String
+  /// Synthesize speech — `POST /api/audio/speak` `{text}` → `{ok, data_url, mime_type,
+  /// provider}`, parsed into playable `TTSAudio`. Pass `profile` (the literal name,
+  /// `"default"` included, #114) to add `?profile=`; `nil` omits it. Errors are HTTP statuses:
+  /// 400 carries the provider's reason in `detail` (`.server(400, detail)`), and an agent
+  /// without the route answers 404 or 405 — both `RESTError.isMissingEndpointVerdict`, which
+  /// callers use to flip their `ttsSupported` gate silently. An unknown `?profile=` is a
+  /// handler 404 and stays `.server(404, detail)` (not a verdict). Blocking synthesis, so the
+  /// request timeout scales with the text (`speakTimeout(forCharacterCount:)`).
+  public var speak: @Sendable (_ connection: ServerConnection, _ text: String, _ profile: String?) async throws -> TTSAudio
+  /// Register this device's APNs token with the `hermes-push` plugin —
+  /// `POST /api/plugins/hermes-push/register` `{device_token, apns_env, app_version}`. The app
+  /// never signs pushes (the plugin signs with a single shared secret), so registration returns
+  /// nothing the app must persist. A missing plugin surfaces as `RESTError.notFound` (404) so
+  /// the caller can capability-gate (mirrors the profiles/attach pattern).
+  public var registerPush: @Sendable (_ connection: ServerConnection, _ deviceToken: String, _ apnsEnv: String, _ appVersion: String) async throws -> Void
+  /// Unregister this device's APNs token — `POST /api/plugins/hermes-push/unregister`
+  /// `{device_token}`. A missing plugin surfaces as `RESTError.notFound` (404).
+  public var unregisterPush: @Sendable (_ connection: ServerConnection, _ deviceToken: String) async throws -> Void
+  /// Ask the plugin to deliver a sample push to this caller's registered device(s) —
+  /// `POST /api/plugins/hermes-push/test`. Used by the Settings "Send test notification"
+  /// button to verify the end-to-end pipeline. A missing plugin surfaces as
+  /// `RESTError.notFound` (404).
+  public var sendTestPush: @Sendable (_ connection: ServerConnection) async throws -> Void
+  /// Cron jobs on the connected agent — `GET /api/cron/jobs` (hermes-agent v0.16+). Pass
+  /// `profile` (the literal name, `"default"` included) to scope to that profile's jobs; `nil` omits the param and the
+  /// server aggregates every profile (each job carries its `profile` annotation). A missing
+  /// endpoint (older agent) surfaces as `RESTError.notFound` so the caller can
+  /// capability-gate back to the flat cron section.
+  public var cronJobs: @Sendable (_ connection: ServerConnection, _ profile: String?) async throws -> [CronJob]
+  /// Fire a cron job immediately — `POST /api/cron/jobs/{id}/trigger`. `profile` as above.
+  public var triggerCronJob: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?) async throws -> Void
+  /// Pause a cron job — `POST /api/cron/jobs/{id}/pause`. `profile` as above.
+  public var pauseCronJob: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?) async throws -> Void
+  /// Resume a paused cron job — `POST /api/cron/jobs/{id}/resume`. `profile` as above.
+  public var resumeCronJob: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?) async throws -> Void
+  /// Delete a cron job — `DELETE /api/cron/jobs/{id}` (no body). `profile` as above. An
+  /// unknown job surfaces as `RESTError.notFound` (the caller treats it as already gone); a
+  /// malformed id is a 400 whose `detail` rides in `RESTError.server`.
+  public var deleteCronJob: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?) async throws -> Void
+  /// A cron job's recent runs — `GET /api/cron/jobs/{id}/runs?limit=` (upstream clamps `limit`
+  /// to 1–100), newest first. `profile` as above. Rows have the `/api/sessions` shape: session
+  /// runs carry `source: "cron"`; script-only runs carry `source: "cron_output"`, a synthetic
+  /// `cron_output:…` id (or none) and no backing session. A row that doesn't decode (no `id`)
+  /// is dropped rather than failing the list.
+  public var cronJobRuns: @Sendable (_ connection: ServerConnection, _ id: String, _ profile: String?, _ limit: Int) async throws -> [Session]
+  /// Authoritative readiness probe for the `hermes-push` plugin — `GET /api/dashboard/plugins/hub`
+  /// → `{plugins: [{name, runtime_status, …}], …}`. Matches the plugin by `name == "hermes-push"`
+  /// and maps: `runtime_status == "enabled"` → `.ready`; present-but-not-enabled or absent →
+  /// `.notReady`; a 404 / transport failure → `.unknown` (don't nag — caller leaves capability
+  /// as-is). Used on the session list and to gate the Settings toggle.
+  public var pushPluginStatus: @Sendable (_ connection: ServerConnection) async throws -> PushPluginStatus
+  /// The same probe as `pushPluginStatus`, but keeping the plugin's reported `version` and
+  /// `can_update_git` — Settings uses them to offer an in-app update when the installed
+  /// plugin is older than `PushSetup.minimumPluginVersion`. Never throws: an unreachable or
+  /// unparseable hub maps to `.unknown` (offer nothing) exactly like the status probe.
+  public var pushPluginInfo: @Sendable (_ connection: ServerConnection) async -> PushPluginInfo = { _ in
+    // `@DependencyClient` needs a default for a non-throwing closure. `.unknown` is also the
+    // right unimplemented behaviour: a test that forgets to stub this offers no update.
+    PushPluginInfo(status: .unknown)
+  }
+  /// Ask the agent to update the plugin in place —
+  /// `POST /api/dashboard/agent-plugins/hermes-push/update`, which runs `git pull --ff-only`
+  /// in `~/.hermes/plugins/hermes-push`.
+  ///
+  /// This only changes files on disk; the running agent keeps the OLD code loaded until it is
+  /// restarted, so callers MUST surface the restart requirement on success. Failure throws
+  /// `RESTError` — the agent answers 400 with a `detail` (not a git checkout, no remote,
+  /// non-fast-forward, git missing) that `RESTError.server` carries verbatim.
+  public var updatePushPlugin: @Sendable (_ connection: ServerConnection) async throws -> PushPluginUpdateResult
+  /// Whether the agent install can be updated — `GET /api/hermes/update/check?force=true`
+  /// (`force` busts the server's 24 h cache, matching the dashboard's "Check now"). A missing
+  /// endpoint surfaces as `RESTError.notFound` / 405 so Settings hides the updater.
+  /// Contract: `docs/features/agent-update.md`.
+  public var checkAgentUpdate: @Sendable (_ connection: ServerConnection) async throws -> AgentUpdateCheck
+  /// Start `hermes update` on the server — `POST /api/hermes/update`. Sent at most ONCE per
+  /// confirmation and never retried: a transport failure is ambiguous (the server may have
+  /// started it). A 2xx `{ok:false}` refusal throws `RESTError.server(status: 200, detail:)`
+  /// carrying the server's message.
+  public var startAgentUpdate: @Sendable (_ connection: ServerConnection) async throws -> AgentUpdateStart
+  /// Read-only progress of the server's update action —
+  /// `GET /api/actions/hermes-update/status?lines=1`.
+  public var agentUpdateStatus: @Sendable (_ connection: ServerConnection) async throws -> AgentUpdateActionStatus
+}
+
+public extension HermesRESTClient {
+  /// Live implementation over `URLSession`. The session is injectable so tests can
+  /// supply a `URLProtocol` mock; `tokenStore` is injectable so bearer tests get their own
+  /// store instead of the process-wide one.
+  static func live(
+    session: URLSession = .shared,
+    tokenStore: BearerTokenStore = .shared
+  ) -> HermesRESTClient {
+    // A dedicated session for password login so captured cookies live in their own jar,
+    // isolated from `.shared`. Inherits the injected session's `protocolClasses` so test
+    // mocks still intercept; gets a fresh `HTTPCookieStorage` and accepts all cookies.
+    let cookieSession = makeCookieSession(from: session)
+    // One resolution point for the regime → header mapping. For `.bearer` this is where a
+    // near-expiry token gets refreshed (single-flight, inside the store) before the call.
+    let authFor: @Sendable (ServerConnection) async throws -> RequestAuth = { conn in
+      try await resolveAuth(for: conn, session: session, tokenStore: tokenStore)
+    }
+    return HermesRESTClient(
+      status: { baseURL in
+        try await get(makeURL(baseURL, "/api/status"), auth: .none, session: session)
+      },
+      probeStatus: { baseURL in
+        await HermesKit.probeStatus(baseURL: baseURL, session: session)
+      },
+      authProviders: { baseURL in
+        do {
+          let response: AuthProvidersResponse = try await get(
+            makeURL(baseURL, "/api/auth/providers"), auth: .none, session: session
+          )
+          return response.providers
+        } catch RESTError.notFound {
+          // Older servers don't expose this endpoint — capability falls back to token-only.
+          return nil
+        }
+      },
+      passwordLogin: { baseURL, provider, username, password in
+        try await login(
+          baseURL: baseURL, provider: provider, username: username, password: password,
+          session: cookieSession
+        )
+      },
+      nativeTokenExchange: { baseURL, code, verifier in
+        // `HermesKit.` disambiguates the free function from the property being initialized.
+        try await HermesKit.nativeTokenExchange(
+          baseURL: baseURL, code: code, verifier: verifier, session: session
+        )
+      },
+      nativeRefresh: { baseURL, expiring in
+        try await HermesKit.nativeRefresh(
+          baseURL: baseURL, expiring: expiring, session: session
+        )
+      },
+      logout: { conn in
+        // THE ONE DELIBERATE EXCEPTION to the project's "surface RPC failures, never
+        // swallow them" rule (CLAUDE.md → Core rules). Logout is a courtesy call that asks
+        // a gated server to drop its side of the session; by the time it fires the app has
+        // already discarded its own credentials and is on its way to the login screen, so a
+        // failure changes nothing the user could see or act on — a banner would be noise on
+        // a screen that is about to disappear. It is logged, never surfaced, and never
+        // rethrown (the closure is non-throwing so no call site can accidentally depend on
+        // the result). Do not "fix" this into a throwing call.
+        do {
+          let url = try makeURL(conn.baseURL, "/auth/logout")
+          try await send(
+            url, method: "POST", body: Data("{}".utf8), auth: authFor(conn), session: session
+          )
+        } catch {
+          authLog.info("POST /auth/logout failed (best-effort, ignored): \(error)")
+        }
+      },
+      sessions: { conn, limit, offset, order, source in
+        let url = try makeURL(conn.baseURL, "/api/sessions", query: [
+          .init(name: "limit", value: String(limit)),
+          .init(name: "offset", value: String(offset)),
+          .init(name: "order", value: order.rawValue),
+        ] + source.queryItems)
+        let response: SessionsResponse = try await get(url, auth: authFor(conn), session: session)
+        return response.sessions.map(\.asSession)
+      },
+      archivedSessions: { conn, limit, offset in
+        let url = try makeURL(conn.baseURL, "/api/sessions", query: [
+          .init(name: "limit", value: String(limit)),
+          .init(name: "offset", value: String(offset)),
+          .init(name: "order", value: SessionOrder.recent.rawValue),
+          .init(name: "archived", value: "only"),
+        ])
+        let response: SessionsResponse = try await get(url, auth: authFor(conn), session: session)
+        return response.sessions.map(\.asSession)
+      },
+      search: { conn, query, profile in
+        let items = [URLQueryItem(name: "q", value: query)]
+          + (profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? [])
+        let url = try makeURL(conn.baseURL, "/api/sessions/search", query: items)
+        let response: SearchResponse = try await get(url, auth: authFor(conn), session: session)
+        return response.results.map(\.asSession)
+      },
+      // Every session write goes through `mutateSession` (fenced on v0.22.1+ agents, see its
+      // doc). Interpolate the RAW id — `makeURL` percent-encodes `comps.path`, so
+      // pre-encoding would double-encode reserved chars.
+      archive: { conn, id, archived, profile in
+        try await mutateSession(
+          conn.baseURL, id: id, profile: profile, method: "PATCH",
+          payload: ["archived": archived], auth: authFor(conn), session: session
+        )
+      },
+      setUnread: { conn, id, unread, profile in
+        try await mutateSession(
+          conn.baseURL, id: id, profile: profile, method: "PATCH",
+          payload: ["unread": unread], auth: authFor(conn), session: session
+        )
+      },
+      setPinned: { conn, id, pinned, profile in
+        try await mutateSession(
+          conn.baseURL, id: id, profile: profile, method: "PATCH",
+          payload: ["pinned": pinned], auth: authFor(conn), session: session
+        )
+      },
+      rename: { conn, id, title, profile in
+        // An empty string clears the title server-side.
+        try await mutateSession(
+          conn.baseURL, id: id, profile: profile, method: "PATCH",
+          payload: ["title": title], auth: authFor(conn), session: session
+        )
+      },
+      deleteSession: { conn, id, profile in
+        // DELETE carries no body: the profile (and, when fenced, the identity) ride in the
+        // query. Any 2xx is success (`{ok, already_absent}` included). On an unfenced
+        // (older) agent, 404 → `.notFound` and 405 (path exists for PATCH/GET only) →
+        // `.server(status: 405, …)` — the missing-endpoint verdict.
+        try await mutateSession(
+          conn.baseURL, id: id, profile: profile, method: "DELETE",
+          payload: nil, auth: authFor(conn), session: session
+        )
+      },
+      transcribe: { conn, dataURL, mimeType in
+        let url = try makeURL(conn.baseURL, "/api/audio/transcribe")
+        var payload: [String: Any] = ["data_url": dataURL]
+        if let mimeType { payload["mime_type"] = mimeType }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let response: TranscriptionResponse = try await postJSON(
+          url, body: body, auth: authFor(conn), session: session
+        )
+        guard response.ok, let transcript = response.transcript else {
+          throw RESTError.transcriptionFailed(response.error ?? "")
+        }
+        return transcript
+      },
+      speak: { conn, text, profile in
+        let query = profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? []
+        let url = try makeURL(conn.baseURL, "/api/audio/speak", query: query)
+        let body = try JSONSerialization.data(withJSONObject: ["text": text])
+        let response: SpeakResponse = try await postJSON(
+          url, body: body, auth: authFor(conn), session: session,
+          timeout: HermesRESTClient.speakTimeout(forCharacterCount: text.count),
+          notFoundMeansNoRoute: true
+        )
+        // The server reports every failure as an HTTP status, so a 2xx `{"ok": false}`
+        // shouldn't happen. Treat it as a failure rather than playing nothing.
+        guard response.ok != false else {
+          throw RESTError.server(status: 200, detail: nil)
+        }
+        guard let dataURL = response.dataURL else { throw RESTError.decoding }
+        do {
+          return try TTSAudio.parse(dataURL: dataURL)
+        } catch {
+          throw RESTError.decoding
+        }
+      },
+      registerPush: { conn, deviceToken, apnsEnv, appVersion in
+        let url = try makeURL(conn.baseURL, "/api/plugins/hermes-push/register")
+        let body = try JSONSerialization.data(withJSONObject: [
+          "device_token": deviceToken,
+          "apns_env": apnsEnv,
+          "app_version": appVersion,
+        ] as [String: Any])
+        // 404 → `RESTError.notFound` (plugin not installed); the caller capability-gates.
+        // The response body carries nothing the app needs (no secret), so we discard it.
+        try await send(url, method: "POST", body: body, auth: authFor(conn), session: session)
+      },
+      unregisterPush: { conn, deviceToken in
+        let url = try makeURL(conn.baseURL, "/api/plugins/hermes-push/unregister")
+        let body = try JSONSerialization.data(withJSONObject: ["device_token": deviceToken])
+        // 404 → `RESTError.notFound` (plugin not installed); the caller capability-gates.
+        try await send(url, method: "POST", body: body, auth: authFor(conn), session: session)
+      },
+      sendTestPush: { conn in
+        let url = try makeURL(conn.baseURL, "/api/plugins/hermes-push/test")
+        // No body needed — the plugin looks up the caller's registered device(s).
+        // 404 → `RESTError.notFound` (plugin not installed); the caller capability-gates.
+        try await send(url, method: "POST", body: Data("{}".utf8), auth: authFor(conn), session: session)
+      },
+      cronJobs: { conn, profile in
+        // `nil` profile omits the param entirely — the server then aggregates all profiles
+        // (its default `all`), matching how the unscoped session list behaves.
+        let query = profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? []
+        let url = try makeURL(conn.baseURL, "/api/cron/jobs", query: query)
+        return try await get(url, auth: authFor(conn), session: session)
+      },
+      triggerCronJob: { conn, id, profile in
+        try await cronJobAction(
+          conn, id: id, action: "trigger", profile: profile,
+          auth: authFor(conn), session: session
+        )
+      },
+      pauseCronJob: { conn, id, profile in
+        try await cronJobAction(
+          conn, id: id, action: "pause", profile: profile,
+          auth: authFor(conn), session: session
+        )
+      },
+      resumeCronJob: { conn, id, profile in
+        try await cronJobAction(
+          conn, id: id, action: "resume", profile: profile,
+          auth: authFor(conn), session: session
+        )
+      },
+      deleteCronJob: { conn, id, profile in
+        let query = profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? []
+        let url = try makeURL(conn.baseURL, "/api/cron/jobs/\(id)", query: query)
+        try await send(url, method: "DELETE", body: nil, auth: authFor(conn), session: session)
+      },
+      cronJobRuns: { conn, id, profile, limit in
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
+        if let profile { query.append(URLQueryItem(name: "profile", value: profile)) }
+        let url = try makeURL(conn.baseURL, "/api/cron/jobs/\(id)/runs", query: query)
+        let response: CronRunsResponse = try await get(url, auth: authFor(conn), session: session)
+        return response.runs
+      },
+      pushPluginStatus: { conn in
+        await fetchPushPluginInfo(conn, authFor: authFor, session: session).status
+      },
+      pushPluginInfo: { conn in
+        await fetchPushPluginInfo(conn, authFor: authFor, session: session)
+      },
+      updatePushPlugin: { conn in
+        // The plugin name is a fixed literal, but it still rides in the path — percent-encode
+        // it rather than interpolating raw, so this can't be the place a future rename breaks.
+        let encoded = PushSetup.pluginName
+          .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? PushSetup.pluginName
+        let url = try makeURL(conn.baseURL, "/api/dashboard/agent-plugins/\(encoded)/update")
+        let response: PluginUpdateResponse = try await postJSON(
+          url, body: Data("{}".utf8), auth: authFor(conn), session: session
+        )
+        // The agent answers 400 (→ `RESTError.server` with `detail`) for a real failure, so a
+        // 2xx `{"ok": false}` shouldn't happen. Treat it as a failure anyway rather than
+        // reporting a success that never occurred.
+        guard response.ok != false else {
+          throw RESTError.server(status: 200, detail: response.error)
+        }
+        // Absent `unchanged` (older agent) → assume something changed and ask for the restart.
+        return PushPluginUpdateResult(unchanged: response.unchanged ?? false)
+      },
+      checkAgentUpdate: { conn in
+        let url = try makeURL(conn.baseURL, "/api/hermes/update/check", query: [
+          URLQueryItem(name: "force", value: "true")
+        ])
+        return try await get(url, auth: authFor(conn), session: session)
+      },
+      startAgentUpdate: { conn in
+        let url = try makeURL(conn.baseURL, "/api/hermes/update")
+        let response: AgentUpdateStartResponse = try await postJSON(
+          url, body: Data("{}".utf8), auth: authFor(conn), session: session
+        )
+        // A refusal (commit build, docker/nix/apt install, externally managed runtime) is a
+        // 2xx `{ok:false, message}` — a failure, never an accepted update.
+        guard response.ok else {
+          throw RESTError.server(status: 200, detail: response.message ?? response.error)
+        }
+        if response.alreadyRunning == true { return .alreadyRunning }
+        let id = response.actionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .started(actionID: (id?.isEmpty ?? true) ? nil : id)
+      },
+      agentUpdateStatus: { conn in
+        let url = try makeURL(conn.baseURL, "/api/actions/hermes-update/status", query: [
+          URLQueryItem(name: "lines", value: "1")
+        ])
+        return try await get(url, auth: authFor(conn), session: session)
+      }
+    )
+  }
+}
+
+extension HermesRESTClient: DependencyKey {
+  public static var liveValue: HermesRESTClient { .live() }
+  // REST calls in tests are unimplemented unless explicitly stubbed. `setUnread` alone is a
+  // no-op default because reducers deliberately issue it as a best-effort compatibility write
+  // on every open; tests that verify shared-read behavior override it and assert the payload.
+  // `speak` deliberately stays unimplemented: only an explicit edge (a completed reply with
+  // auto-speak on, or a Read aloud tap) issues it, so an unexpected call must fail loudly.
+  public static var testValue: HermesRESTClient {
+    var client = HermesRESTClient()
+    client.setUnread = { _, _, _, _ in }
+    // Settings probes the updater on every appearance; an unstubbed agent reads as one that
+    // lacks the endpoint (feature hidden, no further calls), so unrelated Settings tests
+    // don't each have to stub it. `startAgentUpdate` stays unimplemented: it is only ever
+    // sent after an explicit confirmation, so an unexpected call must fail loudly.
+    client.checkAgentUpdate = { _ in throw RESTError.notFound }
+    return client
+  }
+}
+
+public extension HermesRESTClient {
+  /// Per-request timeout for `speak`: synthesis is blocking and the server chunks long text,
+  /// so the wait scales at 35 ms per character with a 180 s floor and a 600 s cap — the
+  /// desktop's `speakText` budget (`apps/desktop/src/api/system.ts`).
+  static func speakTimeout(forCharacterCount count: Int) -> TimeInterval {
+    // Milliseconds first (integer math), then seconds — `0.035 * n` drifts off whole values.
+    min(600, max(180, Double(count * 35) / 1000))
+  }
+}
+
+public extension DependencyValues {
+  var hermesREST: HermesRESTClient {
+    get { self[HermesRESTClient.self] }
+    set { self[HermesRESTClient.self] = newValue }
+  }
+}
+
+/// Shared POST for the cron job actions (`trigger` / `pause` / `resume`) — same
+/// URL/query/body shape, only the trailing path segment differs. Interpolates the RAW id
+/// (`makeURL` percent-encodes the path). 404 → `RESTError.notFound` (job gone or old agent).
+private func cronJobAction(
+  _ conn: ServerConnection, id: String, action: String, profile: String?,
+  auth: RequestAuth, session: URLSession
+) async throws {
+  let query = profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? []
+  let url = try makeURL(conn.baseURL, "/api/cron/jobs/\(id)/\(action)", query: query)
+  try await send(url, method: "POST", body: Data("{}".utf8), auth: auth, session: session)
+}
+
+/// Where the best-effort logout failure goes instead of a banner (see `logout` above).
+private let authLog = Logger(subsystem: "me.honcharenko.HermesKit", category: "auth")
+
+// MARK: - Transport helpers
+//
+// These are `internal` (not `private`) so sibling clients in the package
+// (e.g. `HermesProfileClient`) can reuse the exact same request/decoding/validation
+// path rather than duplicating it.
+
+/// Build a dedicated `URLSession` for password login with its own cookie jar so captured
+/// cookies never bleed into `.shared`. Inherits the source session's `protocolClasses`
+/// (so test mocks still intercept) and accepts all cookies.
+func makeCookieSession(from source: URLSession) -> URLSession {
+  let config = URLSessionConfiguration.ephemeral
+  config.protocolClasses = source.configuration.protocolClasses
+  config.httpCookieStorage = HTTPCookieStorage()
+  config.httpCookieAcceptPolicy = .always
+  config.httpShouldSetCookies = true
+  return URLSession(configuration: config)
+}
+
+/// POST `/auth/password-login` and capture the `Set-Cookie` jar into a `CookieSession`.
+/// Cookies are parsed directly from the response headers (independent of the session's
+/// cookie storage) so the capture is deterministic and fully testable. Maps non-2xx
+/// statuses to `RESTError` (401/404/429/503 carry login-specific copy).
+func login(
+  baseURL: URL, provider: String, username: String, password: String, session: URLSession
+) async throws -> CookieSession {
+  let url = try makeURL(baseURL, "/auth/password-login")
+  var request = URLRequest(url: url)
+  request.httpMethod = "POST"
+  request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+  let payload: [String: Any] = ["provider": provider, "username": username, "password": password]
+  request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+  let data: Data
+  let response: URLResponse
+  do {
+    (data, response) = try await session.data(for: request)
+  } catch {
+    throw RESTError(transport: error)
+  }
+
+  // Login-specific 429/503 copy is scoped here only (see `validate`'s `loginSpecific`).
+  try validate(response, data: data, loginSpecific: true)
+
+  guard let http = response as? HTTPURLResponse else { throw RESTError.unreachable }
+  // Parse Set-Cookie straight from the response headers — `allHeaderFields` is
+  // `[AnyHashable: Any]`; map to `[String: String]` for `HTTPCookie`.
+  let headers = http.allHeaderFields.reduce(into: [String: String]()) { acc, pair in
+    if let key = pair.key as? String, let value = pair.value as? String { acc[key] = value }
+  }
+  let cookies = HTTPCookie.cookies(withResponseHeaderFields: headers, for: url)
+    .map(SerializedCookie.init)
+  return CookieSession(cookies: cookies, username: username, provider: provider)
+}
+
+/// Resolve a connection's auth regime into the header for ONE request.
+///
+/// - `.token` → `.sessionToken` (the legacy `X-Hermes-Session-Token` path, unchanged).
+/// - `.cookie` → `.none` (the session's cookie jar authenticates it).
+/// - `.bearer` → a known-fresh access token from `BearerTokenStore`, which refreshes it
+///   first when it is inside the leeway. That is the ONLY bearer read in the app.
+///
+/// The store's expiry verdict (`GatewayError.authExpired`) is re-thrown as
+/// `RESTError.unauthorized` so it lands in the same error domain as a real 401 and every
+/// existing `asRESTError` → re-auth route keeps working unchanged.
+func resolveAuth(
+  for connection: ServerConnection,
+  session: URLSession,
+  tokenStore: BearerTokenStore
+) async throws -> RequestAuth {
+  switch connection.auth {
+  case let .token(token):
+    return .sessionToken(token)
+  case .cookie:
+    return .none
+  case .bearer:
+    do {
+      let token = try await tokenStore.validAccessToken(refresh: { baseURL, expiring in
+        try await nativeRefresh(baseURL: baseURL, expiring: expiring, session: session)
+      })
+      return .bearer(token)
+    } catch GatewayError.authExpired {
+      throw RESTError.unauthorized
+    }
+  }
+}
+
+/// Budget for the two native-flow token endpoints. Short on purpose: they are interactive
+/// (the user is watching a spinner) and the desktop uses the same 15 s.
+let nativeTokenTimeout: TimeInterval = 15
+
+/// `POST /auth/native/token` — redeem the authorization code with the PKCE verifier.
+/// Every failure the gateway can produce here is a generic 400, surfaced as
+/// `RESTError.server(status: 400, detail:)` with its body verbatim.
+func nativeTokenExchange(
+  baseURL: URL, code: String, verifier: String, session: URLSession
+) async throws -> BearerSession {
+  guard let url = nativeTokenURL(base: baseURL) else { throw RESTError.unreachable }
+  return try await nativeTokenPost(
+    url: url,
+    payload: ["code": code, "code_verifier": verifier],
+    session: session,
+    mapServiceUnavailable: false
+  )
+}
+
+/// `POST /auth/native/refresh` — rotate the token pair.
+///
+/// 401 (`{"error":"session_expired"}` — every provider rejected the refresh token) →
+/// `.unauthorized`, which `BearerTokenStore` turns into its one expiry verdict. 503 (a
+/// provider is momentarily unreachable) → `.serviceUnavailable`, which the store rethrows
+/// with the tokens INTACT so backoff can retry.
+func nativeRefresh(
+  baseURL: URL, expiring: BearerSession, session: URLSession
+) async throws -> BearerSession {
+  guard let url = nativeRefreshURL(base: baseURL) else { throw RESTError.unreachable }
+  var payload: [String: Any] = ["refresh_token": expiring.refreshToken]
+  // Omit an empty provider rather than sending `""`: the gateway then tries every
+  // registered provider, which is also what a partial stored payload wants.
+  if !expiring.provider.isEmpty { payload["provider"] = expiring.provider }
+  return try await nativeTokenPost(
+    url: url, payload: payload, session: session, mapServiceUnavailable: true
+  )
+}
+
+/// Shared POST for the two native-flow token endpoints. Deliberately UNAUTHENTICATED: each
+/// authenticates with what is in its body (the PKCE verifier / the refresh token), and the
+/// access token they mint is the thing we don't have yet.
+private func nativeTokenPost(
+  url: URL, payload: [String: Any], session: URLSession, mapServiceUnavailable: Bool
+) async throws -> BearerSession {
+  var request = URLRequest(url: url, timeoutInterval: nativeTokenTimeout)
+  request.httpMethod = "POST"
+  request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+  request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+  let data: Data
+  let response: URLResponse
+  do {
+    (data, response) = try await session.data(for: request)
+  } catch {
+    throw RESTError(transport: error)
+  }
+
+  // The refresh endpoint's 503 is "the provider is unreachable, keep your tokens" — a
+  // distinct verdict from the generic `.server(503)` every other route gets. Handled here
+  // rather than via `validate`'s `loginSpecific`, which also remaps 429 to login copy.
+  if mapServiceUnavailable, (response as? HTTPURLResponse)?.statusCode == 503 {
+    throw RESTError.serviceUnavailable
+  }
+  try validate(response, data: data)
+
+  do {
+    return try BearerSession(tokenResponse: data)
+  } catch {
+    throw RESTError.decoding
+  }
+}
+
+func makeURL(_ base: URL, _ path: String, query: [URLQueryItem] = []) throws -> URL {
+  guard var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
+    throw RESTError.unreachable
+  }
+  comps.path = path
+  comps.queryItems = query.isEmpty ? nil : query
+  guard let url = comps.url else { throw RESTError.unreachable }
+  return url
+}
+
+func get<T: Decodable>(_ url: URL, auth: RequestAuth, session: URLSession) async throws -> T {
+  var request = URLRequest(url: url)
+  auth.apply(to: &request)
+
+  let data: Data
+  let response: URLResponse
+  do {
+    (data, response) = try await session.data(for: request)
+  } catch {
+    throw RESTError(transport: error)
+  }
+
+  try validate(response, data: data)
+
+  do {
+    return try JSONDecoder().decode(T.self, from: data)
+  } catch {
+    throw RESTError.decoding
+  }
+}
+
+/// The onboarding probe's per-request timeout, in seconds.
+let probeStatusTimeout: TimeInterval = 10
+
+/// `GET /api/status` for the onboarding probe, classifying every failure as a `ProbeFailure`
+/// instead of flattening it to `RESTError` (see `HermesRESTClient.probeStatus`).
+func probeStatus(baseURL: URL, session: URLSession) async -> Result<ServerStatus, ProbeFailure> {
+  guard let url = try? makeURL(baseURL, "/api/status") else {
+    return .failure(.requestFailed("“\(baseURL.absoluteString)” is not a valid server address."))
+  }
+
+  var request = URLRequest(url: url)
+  // Short, so a host that drops packets fails within seconds per candidate, not a minute.
+  request.timeoutInterval = probeStatusTimeout
+  let data: Data
+  let response: URLResponse
+  do {
+    (data, response) = try await session.data(for: request)
+  } catch {
+    return .failure(ProbeFailure.classify(error))
+  }
+
+  guard let http = response as? HTTPURLResponse else {
+    return .failure(.requestFailed("The server sent a response that isn’t HTTP."))
+  }
+  // Every Hermes `/api/status` reports its `version`, signed out included; a 2xx JSON
+  // object without one is some other service.
+  if (200..<300).contains(http.statusCode),
+    let status = try? JSONDecoder().decode(ServerStatus.self, from: data),
+    status.version != nil
+  {
+    return .success(status)
+  }
+  // A non-2xx, or a 2xx whose body isn't Hermes `/api/status` JSON (→ `.notHermes`).
+  return .failure(
+    ProbeFailure.classify(
+      httpStatus: http.statusCode,
+      contentType: http.value(forHTTPHeaderField: "Content-Type"),
+      detail: serverDetail(from: data)
+    )
+  )
+}
+
+/// Validate an HTTP response status, mapping non-success codes to `RESTError`. The
+/// response `data` is read on failure so the server's error `detail` is surfaced
+/// verbatim (see `serverDetail`).
+///
+/// `loginSpecific` opts into the password-login copy for 429/503 (`.rateLimited` /
+/// `.serviceUnavailable`). It is **only** set on the `POST /auth/password-login` path —
+/// for every other (authenticated) REST call a transient 429/503 stays a generic
+/// `.server(status:)`, so it never surfaces misleading "too many login attempts" /
+/// "auth provider unreachable" copy mid-session.
+///
+/// `notFoundMeansNoRoute` narrows `.notFound` to FastAPI's unmatched-route 404 (JSON
+/// `{"detail": "Not Found"}`, or no JSON detail at all): a handler's own 404 with another
+/// detail (`speak`'s unknown `?profile=`: "Profile 'x' does not exist.") stays
+/// `.server(404, detail)`, so it banners instead of reading as a missing-endpoint verdict.
+func validate(
+  _ response: URLResponse, data: Data, loginSpecific: Bool = false,
+  notFoundMeansNoRoute: Bool = false
+) throws {
+  guard let http = response as? HTTPURLResponse else { throw RESTError.unreachable }
+  switch http.statusCode {
+  case 200..<300: break
+  case 401: throw RESTError.unauthorized
+  case 404 where notFoundMeansNoRoute:
+    if let detail = jsonDetail(from: data), detail != fastAPIUnmatchedRouteDetail {
+      throw RESTError.server(status: 404, detail: detail)
+    }
+    throw RESTError.notFound
+  case 404: throw RESTError.notFound
+  case 429 where loginSpecific: throw RESTError.rateLimited
+  case 503 where loginSpecific: throw RESTError.serviceUnavailable
+  default: throw RESTError.server(status: http.statusCode, detail: serverDetail(from: data))
+  }
+}
+
+/// The `detail` FastAPI returns for a path no route matches.
+private let fastAPIUnmatchedRouteDetail = "Not Found"
+
+/// The non-empty string `detail` of a JSON error body, else `nil`.
+private func jsonDetail(from data: Data) -> String? {
+  guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let detail = object["detail"] as? String, !detail.isEmpty
+  else { return nil }
+  return detail
+}
+
+/// Lenient extraction of a human-readable error reason from a non-2xx body: prefer the
+/// JSON `{"detail": …}` field, else the trimmed plain-text body, else `nil` (empty body).
+func serverDetail(from data: Data) -> String? {
+  if let detail = jsonDetail(from: data) { return detail }
+  let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+  return text.isEmpty ? nil : text
+}
+
+/// POST a JSON body and decode the response (used by `transcribe` and `speak`). `timeout`
+/// overrides the request's default 60 s interval when non-nil (`speak` scales it with the
+/// text); `nil` leaves the default untouched. `notFoundMeansNoRoute`: see `validate`.
+func postJSON<T: Decodable>(
+  _ url: URL, body: Data, auth: RequestAuth, session: URLSession,
+  timeout: TimeInterval? = nil, notFoundMeansNoRoute: Bool = false
+) async throws -> T {
+  var request = URLRequest(url: url)
+  if let timeout { request.timeoutInterval = timeout }
+  request.httpMethod = "POST"
+  request.httpBody = body
+  request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+  auth.apply(to: &request)
+
+  let data: Data
+  let response: URLResponse
+  do {
+    (data, response) = try await session.data(for: request)
+  } catch {
+    throw RESTError(transport: error)
+  }
+
+  try validate(response, data: data, notFoundMeansNoRoute: notFoundMeansNoRoute)
+
+  do {
+    return try JSONDecoder().decode(T.self, from: data)
+  } catch {
+    throw RESTError.decoding
+  }
+}
+
+/// Fire a write request (e.g. PATCH) and validate the status, discarding the body.
+/// `notFoundMeansNoRoute`: see `validate`.
+func send(
+  _ url: URL, method: String, body: Data?, auth: RequestAuth, session: URLSession,
+  notFoundMeansNoRoute: Bool = false
+) async throws {
+  var request = URLRequest(url: url)
+  request.httpMethod = method
+  if let body {
+    request.httpBody = body
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+  }
+  auth.apply(to: &request)
+
+  let data: Data
+  let response: URLResponse
+  do {
+    (data, response) = try await session.data(for: request)
+  } catch {
+    throw RESTError(transport: error)
+  }
+
+  try validate(response, data: data, notFoundMeansNoRoute: notFoundMeansNoRoute)
+}
+
+// MARK: - Fenced session mutations (Hermes Agent v0.22.1+)
+
+/// What `GET /api/sessions/{id}/mutation-snapshot` says a write must be fenced on.
+struct SessionMutationSnapshot: Decodable, Equatable {
+  let exists: Bool
+  let runtimeRevision: Int
+  let runtimeGeneration: Int?
+
+  enum CodingKeys: String, CodingKey {
+    case exists
+    case runtimeRevision = "runtime_revision"
+    case runtimeGeneration = "runtime_generation"
+  }
+}
+
+/// How one session write goes out, decided by the snapshot read.
+enum SessionMutationPlan: Equatable {
+  /// A fencing agent: carry `request_id` + `expected_revision` (+ `expected_generation`).
+  case fenced(revision: Int, generation: Int?)
+  /// An agent without the snapshot route: send today's unfenced request.
+  case unfenced
+  /// The fencing agent has no such session.
+  case absent
+}
+
+/// The 404 an agent answers for a path it has no route for: FastAPI's own `"Not Found"`, the
+/// dashboard catch-all's `"No such API endpoint: …"`, the headless `hermes serve` notice, or
+/// a body with no JSON detail at all.
+private func isUnroutedNotFound(_ data: Data) -> Bool {
+  guard let detail = jsonDetail(from: data) else { return true }
+  return detail == fastAPIUnmatchedRouteDetail
+    || detail.hasPrefix("No such API endpoint")
+    || detail.localizedCaseInsensitiveContains("web UI disabled")
+}
+
+/// Read the session's fences — the desktop's `mutateSessionHttp` prepare step. Since Hermes
+/// Agent v0.22.1 every `PATCH`/`DELETE /api/sessions/{id}` without `request_id` +
+/// `expected_revision` is refused with 409 (`client_upgrade_required`). An agent without the
+/// route (unrouted 404, or a pre-guard SPA answering HTML) gets the unfenced request, as on the
+/// desktop. Falling back is safe either way: a fencing agent never commits an unfenced write.
+func readSessionMutationPlan(
+  _ baseURL: URL, id: String, profile: String?, auth: RequestAuth, session: URLSession
+) async throws -> SessionMutationPlan {
+  let query = profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? []
+  var request = URLRequest(url: try makeURL(baseURL, "/api/sessions/\(id)/mutation-snapshot", query: query))
+  auth.apply(to: &request)
+
+  let data: Data
+  let response: URLResponse
+  do {
+    (data, response) = try await session.data(for: request)
+  } catch {
+    throw RESTError(transport: error)
+  }
+  if (response as? HTTPURLResponse)?.statusCode == 404 {
+    guard isUnroutedNotFound(data) else {
+      throw RESTError.server(status: 404, detail: serverDetail(from: data))
+    }
+    return .unfenced
+  }
+  try validate(response, data: data)
+
+  guard let snapshot = try? JSONDecoder().decode(SessionMutationSnapshot.self, from: data),
+    snapshot.runtimeRevision >= 0
+  else { return .unfenced }
+  guard snapshot.exists else { return .absent }
+  return .fenced(revision: snapshot.runtimeRevision, generation: snapshot.runtimeGeneration)
+}
+
+/// The one funnel for `PATCH`/`DELETE /api/sessions/{id}` (archive, restore, rename, pin,
+/// unread, delete). `payload` is the PATCH body's fields (`nil` for DELETE). The profile rides
+/// in the query, and in a PATCH body too (matches desktop); `nil` omits it everywhere.
+///
+/// - Fenced: a fresh `request_id` + the snapshot's revision (and generation) go in the PATCH
+///   body, or the DELETE query. A 404 then is the owner's `not_found` refusal, never a
+///   missing-endpoint verdict (`notFoundMeansNoRoute`).
+/// - Unfenced: byte-identical to the pre-fence request, so the 404/405 delete verdict stands.
+/// - Absent: DELETE succeeds (the server's own `already_absent` contract); a PATCH throws.
+func mutateSession(
+  _ baseURL: URL, id: String, profile: String?, method: String, payload: [String: Any]?,
+  auth: RequestAuth, session: URLSession,
+  requestID: () -> String = { UUID().uuidString.lowercased() }
+) async throws {
+  let plan = try await readSessionMutationPlan(
+    baseURL, id: id, profile: profile, auth: auth, session: session
+  )
+  var query = profile.map { [URLQueryItem(name: "profile", value: $0)] } ?? []
+  var fields = payload ?? [:]
+  switch plan {
+  case .absent:
+    if method == "DELETE" { return }
+    throw RESTError.server(status: 404, detail: "Session not found.")
+  case .unfenced:
+    break
+  case let .fenced(revision, generation):
+    var identity: [(String, Any)] = [
+      ("request_id", requestID()), ("expected_revision", revision),
+    ]
+    if let generation { identity.append(("expected_generation", generation)) }
+    if payload == nil {
+      query += identity.map { URLQueryItem(name: $0.0, value: "\($0.1)") }
+    } else {
+      for (key, value) in identity { fields[key] = value }
+    }
+  }
+  if payload != nil, let profile { fields["profile"] = profile }
+
+  let url = try makeURL(baseURL, "/api/sessions/\(id)", query: query)
+  let body = try payload.map { _ in try JSONSerialization.data(withJSONObject: fields) }
+  try await send(
+    url, method: method, body: body, auth: auth, session: session,
+    notFoundMeansNoRoute: plan != .unfenced
+  )
+}
+
+// MARK: - DTOs (verified against hermes_cli/web_server.py + hermes_state.py)
+
+private struct SessionsResponse: Decodable {
+  let sessions: [SessionListDTO]
+  let total: Int?
+}
+
+/// `GET /api/cron/jobs/{id}/runs` → `{"runs": [...], "limit": n}`. Each row decodes on its own
+/// through `SessionListDTO`: a row that fails (a script-only `cron_output` row without an `id`)
+/// is dropped instead of failing the whole list. A missing `runs` key yields `[]`.
+private struct CronRunsResponse: Decodable {
+  let runs: [Session]
+
+  enum CodingKeys: String, CodingKey { case runs }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    runs = (try c.decodeIfPresent([LenientRow].self, forKey: .runs) ?? []).compactMap { $0.dto?.asSession }
+  }
+
+  /// Swallows a single row's decoding failure so the array decode carries on past it.
+  private struct LenientRow: Decodable {
+    let dto: SessionListDTO?
+    init(from decoder: Decoder) throws { dto = try? SessionListDTO(from: decoder) }
+  }
+}
+
+/// `GET /api/auth/providers`. The server wraps the list in an object
+/// (`{"providers":[…]}`); we also tolerate a bare top-level array for safety.
+private struct AuthProvidersResponse: Decodable {
+  let providers: [AuthProvider]
+
+  init(from decoder: Decoder) throws {
+    if let array = try? [AuthProvider](from: decoder) {
+      providers = array
+      return
+    }
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    providers = try c.decodeIfPresent([AuthProvider].self, forKey: .providers) ?? []
+  }
+
+  enum CodingKeys: String, CodingKey { case providers }
+}
+
+// `internal` so sibling clients (e.g. `HermesProfileClient`'s scoped-session list,
+// which returns rows in the same shape) can reuse the decoding.
+struct SessionListDTO: Decodable {
+  let id: String
+  let title: String?
+  let preview: String?
+  let lastActive: Double?
+  let startedAt: Double?
+  let messageCount: Int?
+  let unread: Bool?
+  let pinned: Bool?
+  let cwd: String?
+  let isActive: Bool?
+  let source: String?
+  let parentSessionID: String?
+  let lineageRootID: String?
+  let model: String?
+
+  enum CodingKeys: String, CodingKey {
+    case id, title, preview, cwd, source, model
+    case lastActive = "last_active"
+    case startedAt = "started_at"
+    case messageCount = "message_count"
+    case unread, pinned
+    case isActive = "is_active"
+    case parentSessionID = "parent_session_id"
+    // Present only on compression-projected rows: the ORIGINAL id the row had before the
+    // server projected it forward to its continuation tip (branch nesting aliases on it).
+    case lineageRootID = "_lineage_root_id"
+  }
+
+  var asSession: Session {
+    Session(
+      id: id,
+      title: title?.nonEmpty,
+      updatedAt: (lastActive ?? startedAt).map { Date(timeIntervalSince1970: $0) },
+      preview: preview?.nonEmpty,
+      cwd: cwd?.nonEmpty,
+      startedAt: startedAt.map { Date(timeIntervalSince1970: $0) },
+      messageCount: messageCount,
+      unread: unread,
+      pinned: pinned,
+      isActive: isActive,
+      source: source,
+      parentSessionID: parentSessionID?.trimmedNonEmpty,
+      lineageRootID: lineageRootID?.trimmedNonEmpty,
+      model: model?.nonEmpty
+    )
+  }
+}
+
+private struct SearchResponse: Decodable {
+  let results: [SearchResultDTO]
+}
+
+/// Search results carry a `snippet`, not a `title` (different shape from the list).
+private struct SearchResultDTO: Decodable {
+  let sessionID: String
+  let snippet: String?
+  let sessionStarted: Double?
+  let pinned: Bool?
+
+  enum CodingKeys: String, CodingKey {
+    case sessionID = "session_id"
+    case snippet, pinned
+    case sessionStarted = "session_started"
+  }
+
+  var asSession: Session {
+    Session(
+      id: sessionID,
+      title: nil,
+      updatedAt: sessionStarted.map { Date(timeIntervalSince1970: $0) },
+      preview: snippet?.nonEmpty,
+      pinned: pinned
+    )
+  }
+}
+
+/// `/api/audio/transcribe` response — `{ok, transcript, provider?}`; `error` on failure.
+private struct TranscriptionResponse: Decodable {
+  let ok: Bool
+  let transcript: String?
+  let provider: String?
+  let error: String?
+}
+
+/// `/api/audio/speak` response — `{ok, data_url, mime_type, provider}`. Only `data_url` is
+/// load-bearing (`TTSAudio.parse` reads the mime type from it).
+private struct SpeakResponse: Decodable {
+  let ok: Bool?
+  let dataURL: String?
+
+  enum CodingKeys: String, CodingKey {
+    case ok
+    case dataURL = "data_url"
+  }
+}
+
+/// `/api/dashboard/plugins/hub` response — `{plugins: [{name, runtime_status, version,
+/// can_update_git, …}], …}`. We read only the four fields below off each row; everything else
+/// is ignored leniently.
+private struct PluginsHubResponse: Decodable {
+  let plugins: [PluginHubItem]
+}
+
+private struct PluginHubItem: Decodable {
+  let name: String
+  let runtimeStatus: String?
+  /// The plugin's own manifest version. The agent emits `""` when the manifest carries none,
+  /// so blank is normalized to `nil` at the mapping site rather than treated as a version.
+  let version: String?
+  /// `true` when the plugin is a git checkout under `~/.hermes/plugins/` — i.e. the agent's
+  /// update endpoint can `git pull` it. Absent on older agents → `false` (no update offered).
+  let canUpdateGit: Bool?
+
+  enum CodingKeys: String, CodingKey {
+    case name
+    case runtimeStatus = "runtime_status"
+    case version
+    case canUpdateGit = "can_update_git"
+  }
+}
+
+/// `POST /api/dashboard/agent-plugins/{name}/update` response —
+/// `{ok, name, output, unchanged}`. `unchanged` is the agent's own read of git's
+/// "Already up to date"; absent on older agents → treated as changed, so we prompt for the
+/// restart rather than claiming nothing happened.
+private struct PluginUpdateResponse: Decodable {
+  let ok: Bool?
+  let unchanged: Bool?
+  let error: String?
+}
+
+/// `POST /api/hermes/update` → `{ok, pid, name, action_id?, already_running?}`, or a 2xx
+/// refusal `{ok:false, error, message, update_command}`.
+private struct AgentUpdateStartResponse: Decodable {
+  let ok: Bool
+  let actionID: String?
+  let alreadyRunning: Bool?
+  let message: String?
+  let error: String?
+
+  enum CodingKeys: String, CodingKey {
+    case ok, message, error, actionID = "action_id", alreadyRunning = "already_running"
+  }
+}
+
+/// Fetch the plugin hub and map our row onto `PushPluginInfo`. Shared by `pushPluginStatus`
+/// (which discards everything but the status) and `pushPluginInfo`, so there is exactly one
+/// decode + mapping path and the two can never disagree about readiness.
+private func fetchPushPluginInfo(
+  _ conn: ServerConnection,
+  authFor: @Sendable (ServerConnection) async throws -> RequestAuth,
+  session: URLSession
+) async -> PushPluginInfo {
+  do {
+    let url = try makeURL(conn.baseURL, "/api/dashboard/plugins/hub")
+    // A bearer refresh failure lands in the same `catch` as everything else → `.unknown`,
+    // which is the right "we can't tell" answer for a probe that must never nag.
+    let response: PluginsHubResponse = try await get(
+      url, auth: authFor(conn), session: session
+    )
+    // Match our plugin by name; `runtime_status == "enabled"` is the only "ready" state.
+    guard let plugin = response.plugins.first(where: { $0.name == PushSetup.pluginName })
+    else { return PushPluginInfo(status: .notReady) } // absent from the list → not installed
+    let version = plugin.version?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return PushPluginInfo(
+      status: plugin.runtimeStatus == "enabled" ? .ready : .notReady,
+      version: (version?.isEmpty ?? true) ? nil : version,
+      canUpdateGit: plugin.canUpdateGit ?? false
+    )
+  } catch {
+    // Endpoint missing (old agent / no dashboard), transport, HTTP or decode failure → we
+    // can't tell. `.unknown` leaves the capability as-is and offers no update.
+    return PushPluginInfo(status: .unknown)
+  }
+}

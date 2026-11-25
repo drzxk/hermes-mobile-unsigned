@@ -1,0 +1,510 @@
+import ComposableArchitecture
+import HermesKit
+import SwiftUI
+
+/// The chat screen: a scrolling transcript, a transient error footer, and
+/// the composer. Streams over the gateway via `ChatFeature`.
+struct ChatView: View {
+  @Bindable var store: StoreOf<ChatFeature>
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+  var body: some View {
+    VStack(spacing: 0) {
+      connectionBanner
+      // The toast overlays the transcript (not the whole screen) so it floats just above
+      // the composer instead of covering it.
+      transcript
+        .overlay(alignment: .bottom) {
+          CopiedToastView(token: store.copiedIDToastToken)
+        }
+      footer
+      // A standing approval or multi-question clarify outranks the greedy transcript for the
+      // fixed region's height. Without it a `VStack` offers each child
+      // `remaining / remainingCount` in flexibility order, so the card — less flexible than
+      // the transcript — is offered roughly *half* of what is left and its scrollable region
+      // collapses onto its floor with the keyboard up: measured at the floor on every iPhone,
+      // i.e. the two-line window #65 was filed about. With the priority the card is offered
+      // the whole remainder first; it hands a tap target's worth back
+      // (`BoundedHeightLayout.reserve`) so the transcript — the context for the decision — is
+      // not starved to 0pt. Applied here rather than inside `pendingCard`'s `switch`: a trait
+      // written inside a `@ViewBuilder` branch does not reach the enclosing stack (measured —
+      // the region stayed on its floor).
+      //
+      // Scoped by `isCompressibleCardPending`: the approval card and the multi-question
+      // clarify card (up to five sections) are the bounded, scrollable cards tall enough to
+      // need the room. A one-question clarify and the secret card are short forms whose
+      // region hugs them, so priority there would only take room from the
+      // transcript (measured on the old rigid clarify card: 160pt → 13pt with a long
+      // question) without giving the card anything it uses. Every card gets a fresh identity
+      // per presentation — a replacement that does not pass through `nil` (a queued request, a
+      // second secret prompt) must not inherit the previous one's `@State`: its scroll offset,
+      // its "Approve all" toggle, its clarify selections, or — worst — a typed sudo password.
+      pendingCard
+        .id(store.pendingInteractionToken)
+        .layoutPriority(store.isCompressibleCardPending ? 1 : 0)
+      queuedPromptsPanel
+      readAloudPill
+      suggestionPanel
+      Divider()
+      ComposerView(
+        text: $store.composerText,
+        isSending: store.isSending,
+        canSend: store.canSend,
+        canQueue: store.canQueue,
+        model: store.model,
+        reasoningEffort: store.reasoningEffort,
+        usage: store.usage,
+        approvalMode: store.displayedApprovalMode,
+        approvalModePending: store.approvalModePending,
+        recording: store.recording,
+        waveformLevels: store.waveformLevels,
+        recordingSeconds: store.recordingSeconds,
+        attachmentsSupported: !store.attachmentsUnsupported,
+        attachments: store.attachments,
+        // Raising a blocking card hands the keyboard back (`ComposerTextView.blockingCardToken`):
+        // the card can't be answered from the composer — `canSend` is false while one stands —
+        // and the keyboard shrinks the very fixed region the card lives in, which is #65's own
+        // root cause. Not a disable: the field stays live for a draft.
+        blockingCardToken: store.pendingInteraction != nil ? store.pendingInteractionToken : nil,
+        autoSpeak: store.autoSpeakReplies,
+        showsAutoSpeak: store.ttsSupported,
+        onModelTap: { store.send(.modelChipTapped) },
+        onApprovalModeSelected: { store.send(.approvalModeSelected($0)) },
+        onSend: { store.send(.composerSubmitted) },
+        onInterrupt: { store.send(.interruptTapped) },
+        onVoiceTap: { store.send(.voiceButtonTapped) },
+        onToggleAutoSpeak: { store.send(.autoSpeakToggled) },
+        onCancelRecording: { store.send(.recordingCancelled) },
+        onAttachPhotos: { store.send(.attachPhotosTapped) },
+        onAttachCamera: { store.send(.attachCameraTapped) },
+        onAttachFiles: { store.send(.attachFilesTapped) },
+        onRemoveAttachment: { store.send(.removeAttachment(id: $0)) },
+        onPasteBegan: { store.send(.attachmentsPasting) },
+        onPasteImages: { store.send(.attachmentsPasted($0)) }
+      )
+    }
+    // The readable-width cap (#80): in a wide column (the iPad detail pane) the whole chat —
+    // banner, transcript + toast, footer, cards, panels, and composer — lives in ONE container
+    // limited to `ChatLayout.readableMaxWidth` and centered by the greedy outer frame, so a
+    // line of prose never runs the full width of a 1024pt window and the composer sits under
+    // the text it belongs to. Every phone width is below the cap, so compact rendering is
+    // byte-identical. The cap is on this OUTER container only: table cells keep
+    // `CappedWidthLayout` (a `.frame(maxWidth:)` cannot cap anything inside a horizontal
+    // `ScrollView` — `docs/features/markdown-rendering.md`), and `MarkdownTableView` still pans
+    // inside the column. Measured in `ChatColumnLayoutTests`.
+    .frame(maxWidth: ChatLayout.readableMaxWidth)
+    .frame(maxWidth: .infinity)
+    // Animates the suggestion panel in/out (and the layout shift it causes). Keyed to
+    // emptiness so mere filtering while typing never animates; nil under reduce-motion,
+    // so the panel then appears/disappears instantly.
+    .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: store.slashSuggestions.isEmpty)
+    // Same treatment for the queued-prompt panel (#66): animate appear/disappear (keyed
+    // to emptiness, so edits/reorders within the queue never animate the whole region).
+    .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: store.queuedPrompts.isEmpty)
+    // And for the read-aloud pill (#74): keyed to idle-vs-active, so preparing → speaking
+    // swaps the pill's label in place without animating the region.
+    .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: store.ttsPlayback.isActive)
+    .navigationTitle(store.title ?? "Chat")
+    .navigationBarTitleDisplayMode(.inline)
+    .toolbar {
+      ToolbarItem(placement: .topBarTrailing) {
+        // A separate view, not an inline `Menu`: this body re-runs on every streaming
+        // event, and an inline menu was rebuilt (and its toolbar button re-animated) each
+        // time — the #82 flicker loop. `ChatMenuButton` observes only its own two fields.
+        ChatMenuButton(store: store)
+      }
+    }
+    .alert("Rename session", isPresented: renameBinding) {
+      TextField("Title", text: renameDraftBinding)
+      Button("Save") { store.send(.confirmRename) }
+      Button("Cancel", role: .cancel) { store.send(.cancelRename) }
+    }
+    // The ⋯ menu's Archive/Delete confirmation — the app's destructive-actions idiom.
+    .bottomActionSheet($store.scope(state: \.confirmationDialog, action: \.confirmationDialog))
+    .task { store.send(.task) }
+    // NOTE: no `.onDisappear` here — disappearance is observed by the DESTINATION in
+    // `AppView` (`AppFeature.chatViewDisappeared`), which guards a nil slot and forwards
+    // the mic/voice cleanup (`.viewDisappeared`). Slot teardown is an `AppFeature` policy,
+    // not a view event.
+    .sheet(item: toolDetailBinding) { row in
+      if case let .tool(call) = row.kind {
+        ToolDetailSheet(call: call)
+      }
+    }
+    // The model picker (#81, #130): an `@Presents` child. Swipe-down and Done both end in
+    // `.modelPicker(.dismiss)`; the chat-owned display inputs are passed straight through.
+    .sheet(item: $store.scope(state: \.modelPicker, action: \.modelPicker)) { pickerStore in
+      ModelPickerSheet(
+        store: pickerStore,
+        currentModel: store.model,
+        currentEffort: store.reasoningEffort,
+        isBusy: store.isSending,
+        extendedReasoningSupported: store.extendedReasoningSupported
+      )
+    }
+    // The file preview (file preview in chat): an `@Presents` child on this feature.
+    // Swipe-down and `Done` both nil the scoped binding, which TCA delivers as
+    // `.filePreview(.dismiss)` — the reducer's temp-file cleanup hook — before `.ifLet`
+    // cancels the child's in-flight read or download.
+    .sheet(item: $store.scope(state: \.filePreview, action: \.filePreview)) { previewStore in
+      FilePreviewSheet(store: previewStore)
+        .presentationDetents([.large])
+    }
+    // Links in the chat body outside the transcript cells (a path in the footer, a card) take
+    // the same route as the cells — see `transcriptCell` for why the cells need their own.
+    .environment(\.openURL, openFileReference)
+  }
+
+  /// The ONE hook that turns a `hermes-file:` link tap into `ChatFeature.fileReferenceTapped`.
+  /// Both prose renderers (`SelectableText`'s coordinator and SwiftUI `Text`) end in
+  /// `openURL`, so this is the only place the private scheme is recognised view-side. Every
+  /// other URL is handed back to the system — an `https` link keeps opening Safari.
+  private var openFileReference: OpenURLAction {
+    OpenURLAction { url in
+      guard let path = FileReference.path(from: url) else { return .systemAction }
+      store.send(.fileReferenceTapped(path: path))
+      return .handled
+    }
+  }
+
+  /// Drives the rename alert's presentation; dismissing routes through `.cancelRename`.
+  private var renameBinding: Binding<Bool> {
+    Binding(
+      get: { store.renameDraft != nil },
+      set: { if !$0 { store.send(.cancelRename) } }
+    )
+  }
+
+  /// A non-optional proxy over the optional draft so the `TextField` stays authoritative
+  /// in the reducer (writes go through the binding action).
+  private var renameDraftBinding: Binding<String> {
+    Binding(
+      get: { store.renameDraft ?? "" },
+      set: { store.renameDraft = $0 }
+    )
+  }
+
+  /// Drives the tool-detail sheet; dismissing routes through the reducer.
+  private var toolDetailBinding: Binding<ChatRow?> {
+    Binding(
+      get: { store.presentedTool },
+      set: { if $0 == nil { store.send(.toolDetailDismissed) } }
+    )
+  }
+
+  /// The transcript REGION: the hero while the chat is empty (#80), otherwise the transcript
+  /// rendered behind the shared renderer boundary. The reducer owns no scroll state —
+  /// stick-to-bottom / pin behaviour is renderer-local. `canLoadOlder` (= `hasMoreAbove`)
+  /// gates the top sentinel so it can't page past the start and can't get stuck mid-load
+  /// when already at the true top of history.
+  ///
+  /// The swap is on `showsEmptyHero` — a HermesKit predicate (fresh new chat, or a resumed
+  /// session whose first hydrate landed empty), so a resumed chat waiting on history never
+  /// flashes the hero. Both branches are greedy in the same way, so the copy-toast overlay
+  /// and the approval-card `layoutPriority` at the call site behave identically for either.
+  @ViewBuilder
+  private var transcript: some View {
+    if store.showsEmptyHero {
+      ChatEmptyHeroView()
+    } else {
+      let items = store.transcriptItems
+      let rowIDs = store.windowRowIDs
+      let turnState: TurnState = store.isSending ? .streaming : .idle
+      let canLoadOlder = store.hasMoreAbove
+      let onLoadOlder = { _ = store.send(.loadOlderRequested) }
+      // Derived once per render, not per cell: every apply reconfigures all visible cells,
+      // so a reply that just became final picks up its action bar on the next pass.
+      let finalReplyIDs = store.visibleFinalReplyRowIDs
+
+      // The transcript is rendered by the `UICollectionView`-backed engine (the only engine):
+      // a diffable data source keyed on the deterministic display-item id (the turn fold —
+      // `TranscriptFold`) gives stable diffing, scroll restoration, and prepend / fold-change
+      // preservation that the pure-SwiftUI `ScrollView` couldn't.
+      CollectionTranscriptView(
+        items: items,
+        rowIDs: rowIDs,
+        turnState: turnState,
+        canLoadOlder: canLoadOlder,
+        onLoadOlder: onLoadOlder,
+        cell: { item in transcriptCell(item, finalReplyIDs: finalReplyIDs) }
+      )
+      // Keyboard dismissal is drag-driven (`.interactively`). We intentionally do NOT add a
+      // `.simultaneousGesture(TapGesture())` here: it would swallow the hosted
+      // `ScrollToBottomButton`'s tap.
+      .scrollDismissesKeyboard(.interactively)
+    }
+  }
+
+  /// Each cell is its own SwiftUI hierarchy inside a `UIHostingConfiguration`, so nothing set
+  /// on `ChatView`'s body reaches it — the `openURL` hook has to be installed HERE, on the
+  /// content the builder hands to the collection view, or a `hermes-file:` tap in a message
+  /// would fall through to the system (which has no handler for the scheme) and do nothing.
+  private func transcriptCell(_ item: TranscriptItem, finalReplyIDs: Set<ChatRow.ID>) -> some View {
+    itemView(item, finalReplyIDs: finalReplyIDs)
+      .environment(\.openURL, openFileReference)
+  }
+
+  /// One display item of the turn fold (`TranscriptFold`). Internal (not `private`) so the
+  /// snapshot suite can lay a whole fold out cell by cell without the collection view.
+  @ViewBuilder
+  func itemView(_ item: TranscriptItem, finalReplyIDs: Set<ChatRow.ID>) -> some View {
+    switch item {
+    case let .row(row):
+      transcriptCellContent(row, isFinalReply: finalReplyIDs.contains(row.id))
+    case let .turnHeader(header):
+      TurnHeaderCell(store: store, header: header)
+    case let .runSummary(summary):
+      RunSummaryView(summary: summary) { store.send(.runSummaryTapped(summary.key)) }
+    case let .toolCall(item):
+      if case let .tool(call) = item.row.kind {
+        ToolStatusView(
+          call: call, isLive: item.isLive, isExpanded: item.isExpanded,
+          onTap: { store.send(.toolCallTapped(item.key)) }
+        )
+      }
+    case let .toolBody(row):
+      if case let .tool(call) = row.kind {
+        ToolBodyView(call: call, onShowAll: { store.send(.toolTapped(id: row.id)) })
+      }
+    case .liveIndicator:
+      TurnHeaderCell(store: store, header: nil)
+    }
+  }
+
+  @ViewBuilder
+  private func transcriptCellContent(_ row: ChatRow, isFinalReply: Bool) -> some View {
+    // Only user messages get the long-press "Copy whole message" menu (mirrors their bubble).
+    // Assistant/tool/reasoning rows render bubble-less plain text — no context menu, so a
+    // long-press starts native text selection (select any range → system Copy/Share) instead
+    // of grabbing the entire row. The menu's long-press gesture would otherwise pre-empt
+    // `.textSelection`.
+    if row.kind.role == .user {
+      rowView(row, isFinalReply: isFinalReply)
+        .contextMenu {
+          Button {
+            store.send(.copyRow(id: row.id))
+          } label: {
+            Label("Copy", systemImage: "doc.on.doc")
+          }
+        }
+    } else {
+      rowView(row, isFinalReply: isFinalReply)
+    }
+  }
+
+  // Internal (not `private`) so snapshot tests can render a single transcript cell
+  // deterministically — a full-device capture of a *streaming* row is flaky (the
+  // spinner keeps animations alive while the collection view re-pins to bottom).
+  /// `isFinalReply`: the row is its turn's final reply (`State.visibleFinalReplyRowIDs`) — the
+  /// only assistant message that gets the action bar; interim commentary renders without one.
+  @ViewBuilder
+  func rowView(_ row: ChatRow, isFinalReply: Bool) -> some View {
+    switch row.kind {
+    case let .message(role, text, isComplete):
+      VStack(alignment: .leading, spacing: 8) {
+        MessageBubbleView(
+          role: role, text: text, isComplete: isComplete,
+          copiedToken: store.recentlyCopiedToken,
+          tokenPrefix: "\(row.id)",
+          onCopyCode: { text, token in store.send(.copyCode(text: text, token: token)) },
+          attachmentImages: row.attachmentImages
+        )
+        // The visible action row (#34): only under a COMPLETED final reply with real
+        // text — hidden while streaming and on interim commentary (the reducer re-guards
+        // all of this).
+        if role == .assistant, isComplete, isFinalReply,
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          MessageActionBar(
+            isCopied: store.recentlyCopiedToken == ChatFeature.rowCopyToken(row.id),
+            isBranchDisabled: !store.canBranch,
+            onCopy: { store.send(.copyRow(id: row.id)) },
+            onBranch: { store.send(.branchFromMessage(id: row.id)) },
+            // A State METHOD: the store's dynamic member lookup reaches properties only.
+            readAloud: store.state.readAloudState(for: row.id),
+            onReadAloud: { store.send(.readAloudTapped(id: row.id)) },
+            onStopReading: { store.send(.stopReadAloud) }
+          )
+        }
+      }
+    case let .tool(call):
+      // Unreachable from the transcript: the fold lays tool rows out as `.toolCall` items (which
+      // expand in place). Kept so `rowView` stays total — a plain line opening the detail sheet.
+      ToolStatusView(call: call, onTap: { store.send(.toolTapped(id: row.id)) })
+    case let .reasoning(text):
+      // One line per reasoning burst (first sentence, tap to disclose). The turn's live label,
+      // timer and status live on its header, not here. `.id` so a reused cell's disclosure
+      // state never carries over to another burst.
+      ReasoningLineView(text: text)
+        .id(row.id)
+    case let .status(kind, text):
+      // Review summaries (#47) are multi-sentence system lines — render them a step
+      // larger (`.footnote`) and selectable so they stay readable/copyable. Other
+      // status kinds ("approval", "clarify", …) keep the terse caption styling.
+      if kind == ChatRow.Kind.reviewStatusKind {
+        Text(text)
+          .font(.footnote)
+          .foregroundStyle(.secondary)
+          .textSelection(.enabled)
+      } else {
+        Text(text).font(.caption).foregroundStyle(.secondary)
+      }
+    case let .commandOutput(text):
+      // Ephemeral slash-command output (#36): bubble-less, dimmed, monospaced, selectable.
+      Text(text)
+        .font(.system(.callout, design: .monospaced))
+        .foregroundStyle(.secondary)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+  }
+
+  /// The slash-command autocomplete panel (#36), anchored just above the composer.
+  /// Rendered only while the reducer's computed `slashSuggestions` is non-empty (catalog
+  /// loaded, composer text is a slash query); a tap inserts via `.slashSuggestionTapped`
+  /// and leaves focus untouched, so the keyboard stays up.
+  ///
+  /// The panel and a blocking card share this non-scrolling `VStack`, and the panel is a fixed
+  /// slab of up to 5.5 rows — so a slash draft standing when a card is raised used to stack the
+  /// two and push the Deny/Approve row and the composer off a small screen (#65 rebuilt out of
+  /// different parts; measured 431pt of content in a 352pt window). `slashSuggestions` is
+  /// therefore empty while `pendingInteraction` is non-nil — a reducer rule, not a condition
+  /// added here, so the derivation stays in one place. The draft itself is untouched.
+  @ViewBuilder
+  private var suggestionPanel: some View {
+    let suggestions = store.slashSuggestions
+    if !suggestions.isEmpty {
+      SlashSuggestionPanel(suggestions: suggestions) { store.send(.slashSuggestionTapped($0)) }
+        .transition(.opacity)
+    }
+  }
+
+  /// Prompts queued while the turn runs (#66), pinned above the composer (and above the
+  /// suggestion panel). Deliberately NOT transcript rows — the panel lives on
+  /// `queuedPrompts` alone, so wholesale hydrates can't wipe or duplicate it. The panel
+  /// self-caps its height (`QueuedPromptsPanel`), respecting the #65 lesson about this
+  /// non-scrolling region.
+  @ViewBuilder
+  private var queuedPromptsPanel: some View {
+    if !store.queuedPrompts.isEmpty {
+      QueuedPromptsPanel(
+        entries: store.queuedPrompts,
+        isParked: store.isQueueParked,
+        composerHasDraft: !store.composerText
+          .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !store.attachments.isEmpty,
+        canSteer: store.canSteerQueued,
+        onSteer: { store.send(.queuedPromptSteer(id: $0)) },
+        steeringID: store.steeringEntryID,
+        onSendNow: { store.send(.queuedPromptSendNow(id: $0)) },
+        onEdit: { store.send(.queuedPromptEditTapped(id: $0)) },
+        onDelete: { store.send(.queuedPromptDeleted(id: $0)) }
+      )
+      .transition(.opacity)
+    }
+  }
+
+  /// The "Reading aloud" pill (#74), shown while a read-aloud clip is preparing or playing.
+  /// Below `pendingCard` on purpose: the pill is one fixed line, and the card's
+  /// `layoutPriority` keeps winning the region's height (#65).
+  @ViewBuilder
+  private var readAloudPill: some View {
+    if store.ttsPlayback.isActive {
+      ReadAloudPill(state: store.ttsPlayback) { store.send(.stopReadAloud) }
+        .transition(.opacity)
+    }
+  }
+
+  @ViewBuilder
+  private var pendingCard: some View {
+    let token = store.pendingInteractionToken
+    switch store.pendingInteraction {
+    case let .approval(request):
+      // The per-presentation identity that keeps this card's `@State` (scroll offset,
+      // "Approve all") from leaking into the next one is applied to `pendingCard` at the
+      // `VStack` call site, so it covers the clarify/secret branches too — see there.
+      ApprovalCardView(
+        request: request,
+        onApprove: { all in store.send(.respondToApproval(token: token, approve: true, all: all)) },
+        onDeny: { store.send(.respondToApproval(token: token, approve: false, all: false)) }
+      )
+    case let .clarify(request):
+      ClarifyCardView(
+        request: request,
+        onSubmit: { answers in store.send(.submitClarify(token: token, answers: answers)) },
+        onSkip: { store.send(.skipClarify(token: token)) }
+      )
+    case let .secret(kind, prompt):
+      SecretCardView(
+        kind: kind,
+        prompt: prompt,
+        onSubmit: { value in store.send(.respondToSecret(token: token, value: value)) },
+        onSkip: { store.send(.skipSecret(token: token)) }
+      )
+    case .none:
+      EmptyView()
+    }
+  }
+
+  @ViewBuilder
+  private var connectionBanner: some View {
+    switch store.status {
+    case .connecting:
+      banner("Connecting…", systemImage: "wifi", tint: .secondary)
+    case .reconnecting:
+      banner("Reconnecting…", systemImage: "wifi.exclamationmark", tint: .orange)
+    case .ready:
+      EmptyView()
+    }
+  }
+
+  private func banner(_ text: String, systemImage: String, tint: Color) -> some View {
+    HStack(spacing: 6) {
+      Image(systemName: systemImage)
+      Text(text)
+      Spacer()
+    }
+    .font(.caption.weight(.medium))
+    .foregroundStyle(tint)
+    .padding(.horizontal)
+    .padding(.vertical, 6)
+    .background(tint.opacity(0.12))
+  }
+
+  @ViewBuilder
+  private var footer: some View {
+    if let error = store.errorBanner {
+      Label(error, systemImage: "exclamationmark.triangle")
+        .font(.caption).foregroundStyle(.red)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+    }
+  }
+}
+
+/// A turn header cell wired to the store: a running header reads the live label, timer and
+/// status HERE — in the hosted cell's own body — so the per-second tick re-renders this one
+/// cell through observation instead of re-laying the whole transcript out. `header == nil` is
+/// the headerless live indicator (`TranscriptItem.liveIndicator`): the running look, no tap.
+private struct TurnHeaderCell: View {
+  let store: StoreOf<ChatFeature>
+  let header: TurnHeader?
+
+  var body: some View {
+    if let header, !header.isRunning {
+      TurnHeaderView(
+        label: header.finishedTitle,
+        elapsedSeconds: nil,
+        isExpanded: header.isExpanded,
+        onTap: { store.send(.turnHeaderTapped(header.ordinal)) }
+      )
+    } else {
+      TurnHeaderView(
+        label: TurnHeader.liveLabel(store.turnActivityLabel),
+        elapsedSeconds: store.turnSeconds,
+        isExpanded: header?.isExpanded,
+        status: store.turnStatus,
+        liveLine: header?.liveLine,
+        onTap: header.map { header in { store.send(.turnHeaderTapped(header.ordinal)) } }
+      )
+    }
+  }
+}
