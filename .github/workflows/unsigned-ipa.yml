@@ -21,13 +21,15 @@ jobs:
           xcodebuild -version
           ls /Applications | grep -i '^Xcode' || true
           if ! command -v tuist >/dev/null 2>&1; then
-            brew install --formula tuist || curl -Ls https://install.tuist.io | bash || true
+            brew install --formula tuist/tuist/tuist@4.218.5 || \
+              brew install --formula tuist/tuist/tuist@4.111.0 || true
           fi
-          for d in "$HOME/.local/bin" "$HOME/.tuist/bin" "$HOME/.local/share/tuist/bin"; do
-            [ -d "$d" ] && echo "$d" >> "$GITHUB_PATH"
-          done
-          export PATH="$HOME/.local/bin:$HOME/.tuist/bin:$HOME/.local/share/tuist/bin:$PATH"
-          command -v tuist && tuist version || { echo "::error::tuist not installed"; exit 1; }
+          if ! command -v tuist >/dev/null 2>&1; then
+            T="$(find /opt/homebrew/Cellar /usr/local/Cellar -type f -name tuist -perm -u+x 2>/dev/null | head -1)"
+            [ -n "$T" ] && export PATH="$(dirname "$T"):$PATH" && echo "$(dirname "$T")" >> "$GITHUB_PATH"
+          fi
+          command -v tuist || { echo "::error::tuist not installed"; exit 1; }
+          tuist version
 
       - name: Generate project (Tuist)
         run: |
